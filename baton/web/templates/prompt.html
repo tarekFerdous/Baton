@@ -9,13 +9,31 @@
 <body>
   <div class="split">
     <div class="card left">
+      <button id="settings-gear" class="gear-btn" type="button" title="Settings">&#9881;</button>
       <h1 class="brand">What are we doing?</h1>
       <p class="user-line">{{ email }}</p>
-      <form id="start-form">
-        <textarea class="prompt-box" name="prompt" placeholder="Describe what you want to build…" required></textarea>
-        <button type="submit" class="glass-btn">Start</button>
-      </form>
-      <div id="interview"></div>
+      <div id="active-project-line" class="active-project-line" hidden>
+        <span id="active-project-name" class="active-project-name"></span>
+        <button id="close-project-btn" class="close-btn" type="button">Close</button>
+      </div>
+
+      <div id="empty-state" class="empty-state" hidden>
+        <p class="empty-state-text">Set A GitHub Local Directory</p>
+        <button id="open-root-btn" class="glass-btn" type="button">Open</button>
+      </div>
+
+      <div id="project-picker" class="project-picker" hidden>
+        <h2 class="picker-heading">Which Project are we working today?</h2>
+        <div id="project-list" class="project-list"></div>
+      </div>
+
+      <div id="main-flow" hidden>
+        <form id="start-form">
+          <textarea class="prompt-box" name="prompt" placeholder="Describe what you want to build…" required></textarea>
+          <button type="submit" class="glass-btn">Start</button>
+        </form>
+        <div id="interview"></div>
+      </div>
     </div>
     <div class="card right">
       <p class="console-title">Session output</p>
@@ -23,16 +41,166 @@
     </div>
   </div>
 
+  <div id="settings-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h2 class="modal-heading">Root Directory</h2>
+      <p id="current-root-dir" class="current-root-dir">No directory set.</p>
+      <button id="modal-pick-btn" class="glass-btn" type="button">Choose Folder…</button>
+      <button id="modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
+    </div>
+  </div>
+
   <script>
     let sessionId = null;
+    let activeProject = null;
     const startForm = document.getElementById("start-form");
     const interviewEl = document.getElementById("interview");
     const consoleEl = document.getElementById("console");
+    const emptyStateEl = document.getElementById("empty-state");
+    const projectPickerEl = document.getElementById("project-picker");
+    const projectListEl = document.getElementById("project-list");
+    const mainFlowEl = document.getElementById("main-flow");
+    const activeProjectLineEl = document.getElementById("active-project-line");
+    const activeProjectNameEl = document.getElementById("active-project-name");
+    const settingsModalEl = document.getElementById("settings-modal");
+    const currentRootDirEl = document.getElementById("current-root-dir");
+
+    let knownRootDir = null;
 
     function logLine(text) {
       consoleEl.textContent += (consoleEl.textContent ? "\n\n" : "") + text;
       consoleEl.scrollTop = consoleEl.scrollHeight;
     }
+
+    function showOnly(el) {
+      [emptyStateEl, projectPickerEl, mainFlowEl].forEach((e) => (e.hidden = e !== el));
+    }
+
+    function renderProjectList(projects) {
+      projectListEl.innerHTML = "";
+      projects.forEach((project) => {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "project-row";
+
+        const name = document.createElement("span");
+        name.className = "project-row-name";
+        name.textContent = project.name;
+        row.appendChild(name);
+
+        const meta = document.createElement("span");
+        meta.className = "project-row-meta";
+        const opened = project.last_opened ? new Date(project.last_opened).toLocaleString() : "never opened";
+        meta.textContent = `${project.branch || "?"} · ${opened}`;
+        row.appendChild(meta);
+
+        row.addEventListener("click", () => openProject(project.id));
+        projectListEl.appendChild(row);
+      });
+    }
+
+    async function openProject(projectId) {
+      const res = await fetch(`/api/projects/${projectId}/open`, { method: "POST" });
+      const data = await res.json();
+      if (data.error) return;
+      activateProject(data.project, data.session_state || {});
+    }
+
+    function activateProject(project, sessionState) {
+      activeProject = project;
+      activeProjectNameEl.textContent = project.name;
+      activeProjectLineEl.hidden = false;
+
+      sessionId = sessionState.session_id || null;
+      consoleEl.textContent = sessionState.console_text || "";
+      interviewEl.innerHTML = sessionState.interview_html || "";
+      startForm.style.display = sessionState.form_hidden ? "none" : "";
+      startForm.reset();
+
+      showOnly(mainFlowEl);
+    }
+
+    async function closeActiveProject() {
+      if (!activeProject) return;
+      const sessionState = {
+        session_id: sessionId,
+        console_text: consoleEl.textContent,
+        interview_html: interviewEl.innerHTML,
+        form_hidden: startForm.style.display === "none",
+      };
+      await fetch(`/api/projects/${activeProject.id}/close`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_state: sessionState }),
+      });
+
+      activeProject = null;
+      sessionId = null;
+      consoleEl.textContent = "";
+      interviewEl.innerHTML = "";
+      startForm.reset();
+      startForm.style.display = "";
+      activeProjectLineEl.hidden = true;
+
+      await loadAppState();
+    }
+
+    async function loadAppState() {
+      const res = await fetch("/api/app-state");
+      const state = await res.json();
+      knownRootDir = state.root_dir;
+
+      if (state.active_project) {
+        activateProject(state.active_project, {});
+        return;
+      }
+
+      if (!state.root_dir) {
+        showOnly(emptyStateEl);
+        return;
+      }
+
+      renderProjectList(state.projects);
+      showOnly(projectPickerEl);
+    }
+
+    function openSettingsModal() {
+      currentRootDirEl.textContent = knownRootDir || "No directory set.";
+      settingsModalEl.hidden = false;
+    }
+
+    function closeSettingsModal() {
+      settingsModalEl.hidden = true;
+    }
+
+    async function pickRootDir() {
+      const pickRes = await fetch("/api/settings/pick-folder", { method: "POST" });
+      const { path } = await pickRes.json();
+      if (!path) return;
+
+      if (knownRootDir && knownRootDir !== path) {
+        const confirmed = window.confirm(
+          "Changing the root directory will wipe all saved project sessions. Continue?"
+        );
+        if (!confirmed) return;
+      }
+
+      const res = await fetch("/api/settings/root-dir", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root_dir: path, confirm: true }),
+      });
+      const data = await res.json();
+      knownRootDir = data.root_dir;
+      closeSettingsModal();
+      await loadAppState();
+    }
+
+    document.getElementById("settings-gear").addEventListener("click", openSettingsModal);
+    document.getElementById("open-root-btn").addEventListener("click", openSettingsModal);
+    document.getElementById("modal-close-btn").addEventListener("click", closeSettingsModal);
+    document.getElementById("modal-pick-btn").addEventListener("click", pickRootDir);
+    document.getElementById("close-project-btn").addEventListener("click", closeActiveProject);
 
     function renderManualReply(onSend) {
       const wrap = document.createElement("div");
@@ -176,6 +344,8 @@
       startForm.style.display = "none";
       renderInterview(data);
     });
+
+    loadAppState();
   </script>
 </body>
 </html>

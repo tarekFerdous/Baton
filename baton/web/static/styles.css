@@ -8,7 +8,7 @@
   --fg-muted: rgba(0, 0, 0, 0.6);
   --glass-bg: rgba(249, 115, 22, 0.65);
   --glass-border: rgba(234, 88, 12, 0.4);
-  --glass-shadow: 0 8px 32px rgba(249, 115, 22, 0.25);
+  --glass-shadow: 0 2px 8px rgba(249, 115, 22, 0.28);
   --card-bg: rgba(255, 255, 255, 0.7);
   --card-border: rgba(0, 0, 0, 0.1);
   --console-bg: rgba(0, 0, 0, 0.045);
@@ -28,7 +28,7 @@
     --fg-muted: rgba(255, 255, 255, 0.65);
     --glass-bg: rgba(249, 115, 22, 0.45);
     --glass-border: rgba(251, 146, 60, 0.3);
-    --glass-shadow: 0 8px 32px rgba(249, 115, 22, 0.3);
+    --glass-shadow: 0 2px 8px rgba(249, 115, 22, 0.35);
     --card-bg: rgba(255, 255, 255, 0.05);
     --card-border: rgba(255, 255, 255, 0.14);
     --console-bg: rgba(255, 255, 255, 0.05);
@@ -106,7 +106,7 @@ body {
 
 .glass-btn:hover {
   transform: translateY(-1px);
-  box-shadow: 0 12px 36px rgba(249, 115, 22, 0.35);
+  box-shadow: 0 4px 12px rgba(249, 115, 22, 0.32);
 }
 
 .glass-btn:disabled {
@@ -125,7 +125,8 @@ body {
 textarea.prompt-box {
   width: 100%;
   min-height: 140px;
-  resize: vertical;
+  resize: none;
+  overflow: hidden;
   padding: 16px 18px;
   border-radius: 20px;
   border: 1px solid var(--card-border);
@@ -344,6 +345,50 @@ textarea.prompt-box:focus {
   line-height: 1.5;
   white-space: pre-wrap;
   color: var(--fg);
+  scrollbar-width: none;
+}
+
+.console::-webkit-scrollbar {
+  display: none;
+}
+
+.scroll-wrap {
+  position: relative;
+  min-height: 0;
+}
+
+.card.right .scroll-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.scroll-wrap > *:first-child {
+  scrollbar-width: none;
+}
+
+.scroll-wrap > *:first-child::-webkit-scrollbar {
+  display: none;
+}
+
+.scroll-pill {
+  position: absolute;
+  top: 0;
+  right: 2px;
+  width: 4px;
+  border-radius: 999px;
+  background: var(--card-bg);
+  opacity: 0;
+  pointer-events: none;
+  transition: background-color 0.2s ease, opacity 0.2s ease;
+}
+
+.scroll-pill.visible {
+  opacity: 1;
+}
+
+.scroll-pill.active {
+  background: var(--glass-bg);
 }
 
 .console:empty::before {
@@ -416,7 +461,8 @@ textarea.prompt-box:focus {
 .answer-box {
   width: 100%;
   min-height: 56px;
-  resize: vertical;
+  resize: none;
+  overflow: hidden;
   padding: 10px 14px;
   border-radius: 14px;
   border: 1px solid var(--card-border);

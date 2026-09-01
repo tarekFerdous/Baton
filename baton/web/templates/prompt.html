@@ -24,7 +24,7 @@
 
       <div id="project-picker" class="project-picker" hidden>
         <h2 class="picker-heading">Which Project are we working today?</h2>
-        <div id="project-list" class="project-list"></div>
+        <div class="scroll-wrap"><div id="project-list" class="project-list"></div></div>
       </div>
 
       <div id="main-flow" hidden>
@@ -32,7 +32,7 @@
           <textarea class="prompt-box" name="prompt" placeholder="Describe what you want to build…" required></textarea>
           <button type="submit" class="glass-btn">Start</button>
         </form>
-        <div id="interview"></div>
+        <div class="scroll-wrap"><div id="interview"></div></div>
       </div>
 
       <div id="session-status" hidden>
@@ -47,7 +47,7 @@
     </div>
     <div class="card right">
       <p class="console-title">Sessions</p>
-      <div id="session-queue" class="session-queue"></div>
+      <div class="scroll-wrap"><div id="session-queue" class="session-queue"></div></div>
     </div>
   </div>
 
@@ -87,6 +87,70 @@
     const retryBtn = document.getElementById("retry-btn");
 
     let knownRootDir = null;
+
+    function autoGrow(el) {
+      el.style.height = "auto";
+      el.style.height = `${el.scrollHeight}px`;
+    }
+
+    const promptBoxEl = document.querySelector(".prompt-box");
+    promptBoxEl.addEventListener("input", () => autoGrow(promptBoxEl));
+
+    function resetPromptBox() {
+      startForm.reset();
+      promptBoxEl.style.height = "";
+    }
+
+    function initScrollWrap(wrap) {
+      const target = wrap.firstElementChild;
+      if (!target) return;
+
+      function ensurePill() {
+        let pill = wrap.querySelector(".scroll-pill");
+        if (!pill) {
+          pill = document.createElement("div");
+          pill.className = "scroll-pill";
+          wrap.appendChild(pill);
+        }
+        return pill;
+      }
+
+      function update() {
+        const pill = ensurePill();
+        const { scrollTop, scrollHeight, clientHeight } = target;
+        if (scrollHeight <= clientHeight + 1) {
+          pill.classList.remove("visible");
+          return;
+        }
+        const pillHeight = Math.max((clientHeight / scrollHeight) * clientHeight, 24);
+        const maxTop = clientHeight - pillHeight;
+        const top = (scrollTop / (scrollHeight - clientHeight)) * maxTop;
+        pill.style.height = `${pillHeight}px`;
+        pill.style.top = `${top}px`;
+        pill.classList.add("visible");
+      }
+
+      let fadeTimer = null;
+      target.addEventListener("scroll", () => {
+        update();
+        const pill = ensurePill();
+        pill.classList.add("active");
+        clearTimeout(fadeTimer);
+        fadeTimer = setTimeout(() => pill.classList.remove("active"), 400);
+      });
+
+      new ResizeObserver(update).observe(target);
+      new MutationObserver(update).observe(target, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["style"],
+        characterData: true,
+      });
+      update();
+    }
+
+    document.querySelectorAll(".scroll-wrap").forEach(initScrollWrap);
 
     function setHeading(text) {
       brandHeadingEl.textContent = text;
@@ -161,7 +225,7 @@
       currentLeftSession = null;
       rightCards.clear();
 
-      startForm.reset();
+      resetPromptBox();
       startForm.style.display = "";
       interviewEl.innerHTML = "";
       setHeading("What are we doing?");
@@ -191,7 +255,7 @@
       leftCardId = null;
       currentLeftSession = null;
       rightCards.clear();
-      startForm.reset();
+      resetPromptBox();
       startForm.style.display = "";
       interviewEl.innerHTML = "";
       activeProjectLineEl.hidden = true;
@@ -268,6 +332,7 @@
       const box = document.createElement("textarea");
       box.className = "answer-box";
       box.placeholder = "Type here…";
+      box.addEventListener("input", () => autoGrow(box));
       wrap.appendChild(box);
 
       const btn = document.createElement("button");
@@ -323,7 +388,7 @@
       currentLeftSession = null;
       renderQueue();
 
-      startForm.reset();
+      resetPromptBox();
       startForm.style.display = "";
       interviewEl.innerHTML = "";
       setHeading("What are we doing?");
@@ -379,6 +444,7 @@
             input.className = "answer-box";
             input.addEventListener("input", () => {
               answers[q.id] = input.value;
+              autoGrow(input);
             });
             block.appendChild(input);
           }

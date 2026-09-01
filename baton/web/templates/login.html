@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Baton</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="card">
+    <h1 class="brand">Baton</h1>
+    <p class="subtitle">Sign in with Claude to start a session.</p>
+    <button id="login-btn" class="glass-btn" onclick="login()">Login with Claude</button>
+    <div id="status" class="status-line"></div>
+  </div>
+
+  <script>
+    const btn = document.getElementById("login-btn");
+    const status = document.getElementById("status");
+    let polling = null;
+
+    async function login() {
+      btn.disabled = true;
+      status.textContent = "Opening a terminal — complete login there…";
+      await fetch("/login", { method: "POST" });
+      polling = setInterval(checkStatus, 2000);
+    }
+
+    async function checkStatus() {
+      const res = await fetch("/api/auth-status");
+      const data = await res.json();
+      if (data.loggedIn) {
+        clearInterval(polling);
+        status.textContent = "Logged in as " + data.email + " — redirecting…";
+        window.location.href = "/prompt";
+      }
+    }
+  </script>
+</body>
+</html>

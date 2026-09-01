@@ -1,0 +1,15 @@
+[project]
+name = "baton"
+version = "0.1.0"
+description = "An agentic software development system in Python. Generates full-stack applications across 13 layers and gates each one on tests that actually run."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "jinja2",
+    "python-multipart",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

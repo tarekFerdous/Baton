@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Baton</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="split">
+    <div class="card left">
+      <h1 class="brand">What are we doing?</h1>
+      <p class="user-line">{{ email }}</p>
+      <form id="start-form">
+        <textarea class="prompt-box" name="prompt" placeholder="Describe what you want to build…" required></textarea>
+        <button type="submit" class="glass-btn">Start</button>
+      </form>
+      <div id="interview"></div>
+    </div>
+    <div class="card right">
+      <p class="console-title">Session output</p>
+      <div id="console" class="console"></div>
+    </div>
+  </div>
+
+  <script>
+    let sessionId = null;
+    const startForm = document.getElementById("start-form");
+    const interviewEl = document.getElementById("interview");
+    const consoleEl = document.getElementById("console");
+
+    function logLine(text) {
+      consoleEl.textContent += (consoleEl.textContent ? "\n\n" : "") + text;
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+    }
+
+    function renderManualReply(onSend) {
+      const wrap = document.createElement("div");
+      wrap.className = "manual-reply";
+
+      const label = document.createElement("p");
+      label.className = "manual-reply-label";
+      label.textContent = "Or type a reply";
+      wrap.appendChild(label);
+
+      const box = document.createElement("textarea");
+      box.className = "answer-box";
+      box.placeholder = "Type here…";
+      wrap.appendChild(box);
+
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "glass-btn";
+      btn.textContent = "Send";
+      btn.style.marginTop = "12px";
+      btn.addEventListener("click", () => onSend(box.value, btn));
+      wrap.appendChild(btn);
+
+      return wrap;
+    }
+
+    async function sendReply(replyText, triggerBtn) {
+      if (!replyText.trim()) return;
+      logLine("> " + replyText);
+      triggerBtn.disabled = true;
+      const res = await fetch("/api/session/continue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, reply: replyText }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        logLine("ERROR: " + data.error);
+        triggerBtn.disabled = false;
+        return;
+      }
+      sessionId = data.session_id;
+      logLine(data.raw);
+      renderInterview(data);
+    }
+
+    function renderInterview(data) {
+      interviewEl.innerHTML = "";
+      const answers = {};
+
+      if (data.preamble) {
+        const p = document.createElement("p");
+        p.className = "preamble";
+        p.textContent = data.preamble;
+        interviewEl.appendChild(p);
+      }
+
+      data.sections.forEach((section) => {
+        if (section.heading) {
+          const h = document.createElement("h3");
+          h.className = "section-heading";
+          h.textContent = section.heading;
+          interviewEl.appendChild(h);
+        }
+
+        section.questions.forEach((q) => {
+          const block = document.createElement("div");
+          block.className = "question-block";
+
+          const label = document.createElement("p");
+          label.className = "question-text";
+          label.textContent = q.text;
+          block.appendChild(label);
+
+          if (q.options) {
+            const optWrap = document.createElement("div");
+            optWrap.className = "option-list";
+            q.options.forEach((opt) => {
+              const btn = document.createElement("button");
+              btn.type = "button";
+              btn.className = "option-btn";
+              btn.textContent = opt;
+              btn.addEventListener("click", () => {
+                answers[q.id] = opt;
+                optWrap.querySelectorAll(".option-btn").forEach((b) => b.classList.remove("selected"));
+                btn.classList.add("selected");
+              });
+              optWrap.appendChild(btn);
+            });
+            block.appendChild(optWrap);
+          } else {
+            const input = document.createElement("textarea");
+            input.className = "answer-box";
+            input.addEventListener("input", () => {
+              answers[q.id] = input.value;
+            });
+            block.appendChild(input);
+          }
+
+          interviewEl.appendChild(block);
+        });
+      });
+
+      if (data.sections.length) {
+        const continueBtn = document.createElement("button");
+        continueBtn.type = "button";
+        continueBtn.className = "glass-btn";
+        continueBtn.textContent = "Continue";
+        continueBtn.addEventListener("click", () => {
+          const orderedIds = data.sections.flatMap((s) => s.questions.map((q) => q.id));
+          const replyText = orderedIds
+            .map((id, i) => `${i + 1}. ${answers[id] || "(no answer)"}`)
+            .join("\n");
+          sendReply(replyText, continueBtn);
+        });
+        interviewEl.appendChild(continueBtn);
+      }
+
+      interviewEl.appendChild(renderManualReply(sendReply));
+    }
+
+    startForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const prompt = startForm.prompt.value;
+      const submitBtn = startForm.querySelector("button");
+      submitBtn.disabled = true;
+      logLine("> /do " + prompt);
+      const res = await fetch("/api/session/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, skill: "do" }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        logLine("ERROR: " + data.error);
+        submitBtn.disabled = false;
+        return;
+      }
+      sessionId = data.session_id;
+      logLine(data.raw);
+      startForm.style.display = "none";
+      renderInterview(data);
+    });
+  </script>
+</body>
+</html>

@@ -442,3 +442,69 @@ textarea.prompt-box:focus {
   color: var(--fg-muted);
   margin: 0 0 10px;
 }
+
+.session-queue {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.session-queue:empty::before {
+  content: "No sessions yet.";
+  color: var(--fg-muted);
+  font-size: 0.85rem;
+}
+
+.session-card {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 16px 18px;
+  border-radius: 18px;
+  border: 1px solid var(--card-border);
+  font-family: inherit;
+  color: var(--fg);
+  cursor: pointer;
+  transition: transform 0.15s ease;
+}
+
+.session-card:hover {
+  transform: translateY(-1px);
+}
+
+.session-card-phase {
+  font-size: 0.88rem;
+  font-variation-settings: "MONO" 0, "CASL" 0, "wght" 650, "slnt" 0, "CRSV" 0;
+  margin: 0 0 6px;
+}
+
+.details-list p {
+  font-size: 0.85rem;
+  margin: 0 0 6px;
+  color: var(--fg);
+}
+
+.phase-label {
+  font-size: 1rem;
+  color: var(--fg-muted);
+  margin: 0 0 20px;
+}
+
+.session-error {
+  color: #dc2626;
+  font-size: 0.85rem;
+  margin: 8px 0;
+}
+
+.session-error-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.session-error-actions .glass-btn {
+  width: auto;
+  flex: 1;
+}

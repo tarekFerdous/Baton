@@ -10,7 +10,7 @@
   <div class="split">
     <div class="card left">
       <button id="settings-gear" class="gear-btn" type="button" title="Settings">&#9881;</button>
-      <h1 class="brand">What are we doing?</h1>
+      <h1 class="brand" id="brand-heading">What are we doing?</h1>
       <p class="user-line">{{ email }}</p>
       <div id="active-project-line" class="active-project-line" hidden>
         <span id="active-project-name" class="active-project-name"></span>
@@ -34,10 +34,20 @@
         </form>
         <div id="interview"></div>
       </div>
+
+      <div id="session-status" hidden>
+        <p id="phase-label" class="phase-label"></p>
+        <div id="details-view" class="details-list"></div>
+        <p id="session-error" class="session-error" hidden></p>
+        <div id="session-error-actions" class="session-error-actions" hidden>
+          <button id="github-login-btn" class="glass-btn" type="button" hidden>Login with GitHub</button>
+          <button id="retry-btn" class="glass-btn" type="button">Retry</button>
+        </div>
+      </div>
     </div>
     <div class="card right">
-      <p class="console-title">Session output</p>
-      <div id="console" class="console"></div>
+      <p class="console-title">Sessions</p>
+      <div id="session-queue" class="session-queue"></div>
     </div>
   </div>
 
@@ -51,29 +61,65 @@
   </div>
 
   <script>
-    let sessionId = null;
     let activeProject = null;
+    let leftCardId = null;
+    let currentLeftSession = null;
+    const rightCards = new Map();
+
     const startForm = document.getElementById("start-form");
     const interviewEl = document.getElementById("interview");
-    const consoleEl = document.getElementById("console");
     const emptyStateEl = document.getElementById("empty-state");
     const projectPickerEl = document.getElementById("project-picker");
     const projectListEl = document.getElementById("project-list");
     const mainFlowEl = document.getElementById("main-flow");
+    const sessionStatusEl = document.getElementById("session-status");
     const activeProjectLineEl = document.getElementById("active-project-line");
     const activeProjectNameEl = document.getElementById("active-project-name");
     const settingsModalEl = document.getElementById("settings-modal");
     const currentRootDirEl = document.getElementById("current-root-dir");
+    const brandHeadingEl = document.getElementById("brand-heading");
+    const sessionQueueEl = document.getElementById("session-queue");
+    const phaseLabelEl = document.getElementById("phase-label");
+    const detailsViewEl = document.getElementById("details-view");
+    const sessionErrorEl = document.getElementById("session-error");
+    const sessionErrorActionsEl = document.getElementById("session-error-actions");
+    const githubLoginBtn = document.getElementById("github-login-btn");
+    const retryBtn = document.getElementById("retry-btn");
 
     let knownRootDir = null;
 
-    function logLine(text) {
-      consoleEl.textContent += (consoleEl.textContent ? "\n\n" : "") + text;
-      consoleEl.scrollTop = consoleEl.scrollHeight;
+    function setHeading(text) {
+      brandHeadingEl.textContent = text;
+    }
+
+    function headingForPhase(phase) {
+      return (
+        {
+          grilling: "Ongoing Grilling Session...",
+          creating_prd: "Creating PRD...",
+          creating_issues: "Creating Issues...",
+          details: "Details",
+        }[phase] || "What are we doing?"
+      );
+    }
+
+    function phaseLabelText(phase) {
+      return (
+        {
+          grilling: "Ongoing Grilling Session...",
+          creating_prd: "Creating PRD...",
+          creating_issues: "Creating Issues...",
+          details: "Done",
+        }[phase] || phase
+      );
     }
 
     function showOnly(el) {
-      [emptyStateEl, projectPickerEl, mainFlowEl].forEach((e) => (e.hidden = e !== el));
+      [emptyStateEl, projectPickerEl, mainFlowEl, sessionStatusEl].forEach((e) => (e.hidden = e !== el));
+    }
+
+    function hueForCard(cardId) {
+      return Math.round((cardId * 137.508) % 360);
     }
 
     function renderProjectList(projects) {
@@ -103,43 +149,51 @@
       const res = await fetch(`/api/projects/${projectId}/open`, { method: "POST" });
       const data = await res.json();
       if (data.error) return;
-      activateProject(data.project, data.session_state || {});
+      await activateProject(data.project);
     }
 
-    function activateProject(project, sessionState) {
+    async function activateProject(project) {
       activeProject = project;
       activeProjectNameEl.textContent = project.name;
       activeProjectLineEl.hidden = false;
 
-      sessionId = sessionState.session_id || null;
-      consoleEl.textContent = sessionState.console_text || "";
-      interviewEl.innerHTML = sessionState.interview_html || "";
-      startForm.style.display = sessionState.form_hidden ? "none" : "";
-      startForm.reset();
+      leftCardId = null;
+      currentLeftSession = null;
+      rightCards.clear();
 
+      startForm.reset();
+      startForm.style.display = "";
+      interviewEl.innerHTML = "";
+      setHeading("What are we doing?");
       showOnly(mainFlowEl);
+
+      await loadSessionQueue();
+    }
+
+    async function loadSessionQueue() {
+      if (!activeProject) return;
+      const res = await fetch(`/api/projects/${activeProject.id}/sessions`);
+      const data = await res.json();
+      rightCards.clear();
+      (data.sessions || []).forEach((s) => rightCards.set(s.card_id, s));
+      renderQueue();
     }
 
     async function closeActiveProject() {
       if (!activeProject) return;
-      const sessionState = {
-        session_id: sessionId,
-        console_text: consoleEl.textContent,
-        interview_html: interviewEl.innerHTML,
-        form_hidden: startForm.style.display === "none",
-      };
       await fetch(`/api/projects/${activeProject.id}/close`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_state: sessionState }),
+        body: JSON.stringify({ session_state: {} }),
       });
 
       activeProject = null;
-      sessionId = null;
-      consoleEl.textContent = "";
-      interviewEl.innerHTML = "";
+      leftCardId = null;
+      currentLeftSession = null;
+      rightCards.clear();
       startForm.reset();
       startForm.style.display = "";
+      interviewEl.innerHTML = "";
       activeProjectLineEl.hidden = true;
 
       await loadAppState();
@@ -151,7 +205,7 @@
       knownRootDir = state.root_dir;
 
       if (state.active_project) {
-        activateProject(state.active_project, {});
+        await activateProject(state.active_project);
         return;
       }
 
@@ -227,24 +281,53 @@
       return wrap;
     }
 
+    function showGrillingError(message) {
+      let err = interviewEl.querySelector(".session-error");
+      if (!err) {
+        err = document.createElement("p");
+        err.className = "session-error";
+        interviewEl.prepend(err);
+      }
+      err.textContent = message;
+    }
+
     async function sendReply(replyText, triggerBtn) {
-      if (!replyText.trim()) return;
-      logLine("> " + replyText);
+      if (!replyText.trim() || leftCardId === null) return;
       triggerBtn.disabled = true;
       const res = await fetch("/api/session/continue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, reply: replyText }),
+        body: JSON.stringify({ card_id: leftCardId, reply: replyText }),
       });
       const data = await res.json();
-      if (data.error) {
-        logLine("ERROR: " + data.error);
-        triggerBtn.disabled = false;
+      triggerBtn.disabled = false;
+
+      if (data.error && !data.phase) {
+        showGrillingError(data.error);
         return;
       }
-      sessionId = data.session_id;
-      logLine(data.raw);
-      renderInterview(data);
+
+      if (data.phase === "grilling" || data.sections) {
+        currentLeftSession = {
+          card_id: leftCardId,
+          phase: "grilling",
+          interview: { preamble: data.preamble, sections: data.sections },
+        };
+        renderInterview(data);
+        return;
+      }
+
+      // Grilling finished: minimize this card to the right queue and free the left card.
+      rightCards.set(leftCardId, data);
+      leftCardId = null;
+      currentLeftSession = null;
+      renderQueue();
+
+      startForm.reset();
+      startForm.style.display = "";
+      interviewEl.innerHTML = "";
+      setHeading("What are we doing?");
+      showOnly(mainFlowEl);
     }
 
     function renderInterview(data) {
@@ -258,7 +341,7 @@
         interviewEl.appendChild(p);
       }
 
-      data.sections.forEach((section) => {
+      (data.sections || []).forEach((section) => {
         if (section.heading) {
           const h = document.createElement("h3");
           h.className = "section-heading";
@@ -304,7 +387,7 @@
         });
       });
 
-      if (data.sections.length) {
+      if (data.sections && data.sections.length) {
         const continueBtn = document.createElement("button");
         continueBtn.type = "button";
         continueBtn.className = "glass-btn";
@@ -322,26 +405,150 @@
       interviewEl.appendChild(renderManualReply(sendReply));
     }
 
+    function renderDetailsList(details) {
+      const wrap = document.createElement("div");
+      if (details && details.prd) {
+        const p = document.createElement("p");
+        p.textContent = `PRD #${details.prd.number}: ${details.prd.title}`;
+        wrap.appendChild(p);
+      }
+      (details && details.issues ? details.issues : []).forEach((issue) => {
+        const p = document.createElement("p");
+        p.textContent = `Issue #${issue.number}: ${issue.title}`;
+        wrap.appendChild(p);
+      });
+      return wrap;
+    }
+
+    function renderSessionStatus(session) {
+      detailsViewEl.innerHTML = "";
+      sessionErrorEl.hidden = true;
+      sessionErrorActionsEl.hidden = true;
+      githubLoginBtn.hidden = true;
+
+      phaseLabelEl.textContent = session.error ? "Error" : phaseLabelText(session.phase);
+
+      if (session.error) {
+        sessionErrorEl.hidden = false;
+        sessionErrorEl.textContent = session.error;
+        sessionErrorActionsEl.hidden = false;
+        githubLoginBtn.hidden = !session.needs_github_login;
+        return;
+      }
+
+      if (session.phase === "details" && session.details) {
+        detailsViewEl.appendChild(renderDetailsList(session.details));
+      }
+    }
+
+    function renderLeftSession(session) {
+      currentLeftSession = session;
+      leftCardId = session.card_id;
+
+      if (session.phase === "grilling") {
+        startForm.style.display = "none";
+        setHeading(headingForPhase("grilling"));
+        showOnly(mainFlowEl);
+        renderInterview(session.interview || { preamble: "", sections: [] });
+        return;
+      }
+
+      setHeading(headingForPhase(session.phase));
+      showOnly(sessionStatusEl);
+      renderSessionStatus(session);
+    }
+
+    function renderQueue() {
+      sessionQueueEl.innerHTML = "";
+      rightCards.forEach((session) => {
+        const card = document.createElement("button");
+        card.type = "button";
+        card.className = "session-card";
+        const hue = hueForCard(session.card_id);
+        card.style.background = `hsla(${hue}, 70%, 55%, 0.18)`;
+        card.style.borderColor = `hsla(${hue}, 70%, 55%, 0.45)`;
+
+        const label = document.createElement("p");
+        label.className = "session-card-phase";
+        label.textContent = session.error ? "Error" : phaseLabelText(session.phase);
+        card.appendChild(label);
+
+        if (session.error) {
+          const err = document.createElement("p");
+          err.className = "session-error";
+          err.textContent = session.error;
+          card.appendChild(err);
+        } else if (session.phase === "details" && session.details) {
+          card.appendChild(renderDetailsList(session.details));
+        }
+
+        card.addEventListener("click", () => focusCard(session.card_id));
+        sessionQueueEl.appendChild(card);
+      });
+    }
+
+    function focusCard(cardId) {
+      const session = rightCards.get(cardId);
+      if (!session) return;
+      rightCards.delete(cardId);
+
+      if (leftCardId !== null && currentLeftSession) {
+        rightCards.set(leftCardId, currentLeftSession);
+      }
+
+      renderLeftSession(session);
+      renderQueue();
+    }
+
+    retryBtn.addEventListener("click", async () => {
+      if (leftCardId === null) return;
+      const res = await fetch(`/api/sessions/${leftCardId}/retry`, { method: "POST" });
+      const data = await res.json();
+      renderLeftSession(data);
+    });
+
+    githubLoginBtn.addEventListener("click", async () => {
+      await fetch("/api/github-login", { method: "POST" });
+      pollGithubLogin();
+    });
+
+    function pollGithubLogin() {
+      const cardId = leftCardId;
+      const interval = setInterval(async () => {
+        const res = await fetch("/api/github-auth-status");
+        const { logged_in } = await res.json();
+        if (!logged_in) return;
+        clearInterval(interval);
+        if (leftCardId !== cardId) return;
+        const retryRes = await fetch(`/api/sessions/${cardId}/retry`, { method: "POST" });
+        renderLeftSession(await retryRes.json());
+      }, 3000);
+    }
+
     startForm.addEventListener("submit", async (e) => {
       e.preventDefault();
       const prompt = startForm.prompt.value;
       const submitBtn = startForm.querySelector("button");
       submitBtn.disabled = true;
-      logLine("> /do " + prompt);
       const res = await fetch("/api/session/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, skill: "do" }),
+        body: JSON.stringify({ prompt }),
       });
       const data = await res.json();
+      submitBtn.disabled = false;
       if (data.error) {
-        logLine("ERROR: " + data.error);
-        submitBtn.disabled = false;
+        showGrillingError(data.error);
         return;
       }
-      sessionId = data.session_id;
-      logLine(data.raw);
+      leftCardId = data.card_id;
+      currentLeftSession = {
+        card_id: data.card_id,
+        phase: "grilling",
+        interview: { preamble: data.preamble, sections: data.sections },
+      };
       startForm.style.display = "none";
+      setHeading(headingForPhase("grilling"));
       renderInterview(data);
     });
 

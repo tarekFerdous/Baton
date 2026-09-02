@@ -36,7 +36,7 @@ def run_prompt(
     env.pop("ANTHROPIC_API_KEY", None)
     env.pop("ANTHROPIC_AUTH_TOKEN", None)
 
-    args = ["claude", "-p", "--output-format", "json"]
+    args = ["claude", "-p", "--output-format", "json", "--dangerously-skip-permissions"]
     if session_id:
         args += ["--resume", session_id]
     if model:

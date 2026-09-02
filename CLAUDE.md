@@ -20,6 +20,14 @@ artifact presence.
   - Watch for subscription usage limits (rolling time-window allowances on
     Pro/Max/Team/Enterprise) since heavy automation across many phases can
     hit these caps faster than interactive use.
+- **Unattended sessions skip permission checks.** Every session spawned via
+  `run_prompt()` runs headless (`-p`, stdin-piped, no TTY), so there is no
+  terminal for Claude to prompt into and no human present to answer an
+  interactive tool-permission request. `run_prompt()` therefore passes
+  `--dangerously-skip-permissions`. This is a deliberately minimal, unblocking
+  change — sandboxing/isolation per session, an audit trail of what a session
+  did, and rollback/recovery from an unattended destructive action are known
+  open gaps, not solved here and deferred to future work.
 
 ## Open questions
 

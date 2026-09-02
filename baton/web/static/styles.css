@@ -72,6 +72,7 @@ body {
   -webkit-backdrop-filter: blur(16px) saturate(1.4);
   box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
   text-align: center;
+  overflow: hidden;
 }
 
 .brand {
@@ -240,6 +241,23 @@ textarea.prompt-box:focus {
   flex-direction: column;
   gap: 10px;
   overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+#project-picker,
+#main-flow,
+#session-status {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+#project-picker[hidden],
+#main-flow[hidden],
+#session-status[hidden] {
+  display: none;
 }
 
 .project-row {
@@ -355,9 +373,6 @@ textarea.prompt-box:focus {
 .scroll-wrap {
   position: relative;
   min-height: 0;
-}
-
-.card.right .scroll-wrap {
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -495,6 +510,7 @@ textarea.prompt-box:focus {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  min-height: 0;
 }
 
 .session-queue:empty::before {
@@ -524,12 +540,20 @@ textarea.prompt-box:focus {
   font-size: 0.88rem;
   font-variation-settings: "MONO" 0, "CASL" 0, "wght" 650, "slnt" 0, "CRSV" 0;
   margin: 0 0 6px;
+  overflow-wrap: anywhere;
+}
+
+#details-view {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
 }
 
 .details-list p {
   font-size: 0.85rem;
   margin: 0 0 6px;
   color: var(--fg);
+  overflow-wrap: anywhere;
 }
 
 .phase-label {
@@ -542,6 +566,7 @@ textarea.prompt-box:focus {
   color: #dc2626;
   font-size: 0.85rem;
   margin: 8px 0;
+  overflow-wrap: anywhere;
 }
 
 .session-error-actions {

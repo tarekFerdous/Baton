@@ -32,5 +32,7 @@ def _isolated_implement_queues(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolated_afk_loop(monkeypatch):
-    """Same story again, but for the AFK loop's per-project idle clock."""
+    """Same story again, but for the AFK loop's per-project idle clock and
+    its per-project undismissed-notification queue."""
     monkeypatch.setattr(afk_loop, "_last_activity", {})
+    monkeypatch.setattr(afk_loop, "_notifications", {})

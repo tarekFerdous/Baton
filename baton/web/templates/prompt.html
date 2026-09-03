@@ -80,6 +80,14 @@
     </div>
   </div>
 
+  <div id="afk-notification-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h2 class="modal-heading">AFK Implementation</h2>
+      <div id="afk-notification-lines"></div>
+      <button id="afk-modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
+    </div>
+  </div>
+
   <script>
     let activeProject = null;
     let leftCardId = null;
@@ -112,6 +120,9 @@
     const retryBtn = document.getElementById("retry-btn");
     const prdCardEl = document.getElementById("prd-card");
     const prdButtonRowEl = document.getElementById("prd-button-row");
+    const afkNotificationModalEl = document.getElementById("afk-notification-modal");
+    const afkNotificationLinesEl = document.getElementById("afk-notification-lines");
+    const afkModalCloseBtn = document.getElementById("afk-modal-close-btn");
 
     let knownRootDir = null;
     let knownAfkHours = null;
@@ -283,6 +294,38 @@
 
       await loadSessionQueue();
       await loadPrdList();
+      await loadAfkNotifications();
+    }
+
+    function renderAfkNotifications(notifications) {
+      afkNotificationLinesEl.innerHTML = "";
+      if (!notifications || notifications.length === 0) {
+        afkNotificationModalEl.hidden = true;
+        return;
+      }
+
+      notifications.forEach((n, i) => {
+        const p = document.createElement("p");
+        p.textContent =
+          i === 0
+            ? `PRD: ${n.number}: ${n.title} is being afk implemented`
+            : `another PRD: ${n.number}: ${n.title}`;
+        afkNotificationLinesEl.appendChild(p);
+      });
+      afkNotificationModalEl.hidden = false;
+    }
+
+    async function loadAfkNotifications() {
+      if (!activeProject) return;
+      const res = await fetch(`/api/projects/${activeProject.id}/afk-notifications`);
+      const data = await res.json();
+      renderAfkNotifications(data.notifications || []);
+    }
+
+    async function dismissAfkNotifications() {
+      if (!activeProject) return;
+      await fetch(`/api/projects/${activeProject.id}/afk-notifications/dismiss`, { method: "POST" });
+      renderAfkNotifications([]);
     }
 
     // PRD numbers with a live (non-terminal) implement session running --
@@ -423,6 +466,7 @@
       });
       refreshImplementingPrdNumbers(data.sessions || []);
       renderQueue();
+      await loadAfkNotifications();
     }
 
     async function closeActiveProject() {
@@ -443,6 +487,8 @@
       activeProjectLineEl.hidden = true;
       prdButtonRowEl.innerHTML = "";
       prdCardEl.hidden = true;
+      afkNotificationLinesEl.innerHTML = "";
+      afkNotificationModalEl.hidden = true;
 
       await loadAppState();
     }
@@ -538,6 +584,7 @@
     afkHoursInputEl.addEventListener("change", updateAfkHours);
     parallelImplementationToggleEl.addEventListener("change", updateParallelImplementation);
     document.getElementById("close-project-btn").addEventListener("click", closeActiveProject);
+    afkModalCloseBtn.addEventListener("click", dismissAfkNotifications);
 
     let eventSource = null;
     let currentTextEl = null;

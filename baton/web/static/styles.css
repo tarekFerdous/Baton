@@ -444,6 +444,19 @@ textarea.prompt-box:focus {
   border-color: var(--card-border);
 }
 
+#afk-notification-lines {
+  margin: 0 0 20px;
+}
+
+#afk-notification-lines p {
+  margin: 0 0 8px;
+  line-height: 1.4;
+}
+
+#afk-notification-lines p:last-child {
+  margin-bottom: 0;
+}
+
 .card.middle,
 .card.right {
   display: flex;

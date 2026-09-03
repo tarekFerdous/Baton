@@ -23,9 +23,27 @@ from baton import db, session_runner
 # self-implement fire). Process-lifetime only.
 _last_activity: dict[int, float] = {}
 
+# project_id -> list of undismissed self-implement notifications, each
+# {"number": int, "title": str}. Server-held (not per-connection/per-browser-
+# tab) so a page refresh can rebuild the modal from this state -- and, like
+# `_last_activity`, in-memory only: a Baton restart clears it.
+_notifications: dict[int, list[dict]] = {}
+
 
 def record_activity(project_id: int) -> None:
     _last_activity[project_id] = time.monotonic()
+
+
+def add_notification(project_id: int, number: int, title: str) -> None:
+    _notifications.setdefault(project_id, []).append({"number": number, "title": title})
+
+
+def get_notifications(project_id: int) -> list[dict]:
+    return _notifications.get(project_id, [])
+
+
+def dismiss_notifications(project_id: int) -> None:
+    _notifications.pop(project_id, None)
 
 
 async def check_once(
@@ -63,6 +81,7 @@ async def check_once(
     # Reset before firing so a slow implement job can't cause a second fire
     # mid-flight on the next tick.
     record_activity(project_id)
+    add_notification(project_id, top["number"], top["title"])
     await session_runner.start_or_queue_implement(project_id, top["number"], top["title"], cwd)
 
 

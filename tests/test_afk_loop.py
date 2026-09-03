@@ -144,3 +144,88 @@ def test_switching_projects_scopes_the_clock(client, tmp_path, monkeypatch):
     # A's clock is untouched and still eligible.
     asyncio.run(afk_loop.check_once(project_a, cwd_a, prd_list))
     assert calls == [(project_a, 5, "Top PRD", cwd_a)]
+
+
+def test_a_fire_adds_exactly_one_notification(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    db.set_afk_hours(conn, 1)
+    afk_loop._last_activity[project_id] = time.monotonic() - 3700
+
+    async def fake_start_or_queue_implement(pid, number, title, job_cwd):
+        return {"card_id": 1}
+
+    monkeypatch.setattr(session_runner, "start_or_queue_implement", fake_start_or_queue_implement)
+
+    asyncio.run(
+        afk_loop.check_once(project_id, cwd, _stub_prds((5, "Top PRD", False), (6, "Other PRD", True)))
+    )
+
+    assert afk_loop.get_notifications(project_id) == [{"number": 5, "title": "Top PRD"}]
+
+
+def test_a_second_fire_before_dismissal_appends_a_second_notification(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    db.set_afk_hours(conn, 1)
+
+    async def fake_start_or_queue_implement(pid, number, title, job_cwd):
+        return {"card_id": 1}
+
+    monkeypatch.setattr(session_runner, "start_or_queue_implement", fake_start_or_queue_implement)
+
+    prd_list = _stub_prds((5, "Top PRD", False))
+
+    afk_loop._last_activity[project_id] = time.monotonic() - 3700
+    asyncio.run(afk_loop.check_once(project_id, cwd, prd_list))
+
+    # Age the clock past threshold again for a second, independent fire.
+    afk_loop._last_activity[project_id] = time.monotonic() - 3700
+    asyncio.run(afk_loop.check_once(project_id, cwd, prd_list))
+
+    assert afk_loop.get_notifications(project_id) == [
+        {"number": 5, "title": "Top PRD"},
+        {"number": 5, "title": "Top PRD"},
+    ]
+
+
+def test_dismiss_notifications_empties_the_queue(client, tmp_path):
+    project_id = _open_project(client, tmp_path, "proj")
+
+    afk_loop.add_notification(project_id, 5, "Top PRD")
+    assert afk_loop.get_notifications(project_id) == [{"number": 5, "title": "Top PRD"}]
+
+    afk_loop.dismiss_notifications(project_id)
+
+    assert afk_loop.get_notifications(project_id) == []
+
+
+def test_a_fire_after_dismissal_produces_a_fresh_single_entry_list(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    db.set_afk_hours(conn, 1)
+
+    async def fake_start_or_queue_implement(pid, number, title, job_cwd):
+        return {"card_id": 1}
+
+    monkeypatch.setattr(session_runner, "start_or_queue_implement", fake_start_or_queue_implement)
+
+    prd_list = _stub_prds((5, "Top PRD", False))
+
+    afk_loop._last_activity[project_id] = time.monotonic() - 3700
+    asyncio.run(afk_loop.check_once(project_id, cwd, prd_list))
+    assert len(afk_loop.get_notifications(project_id)) == 1
+
+    afk_loop.dismiss_notifications(project_id)
+    assert afk_loop.get_notifications(project_id) == []
+
+    afk_loop._last_activity[project_id] = time.monotonic() - 3700
+    asyncio.run(afk_loop.check_once(project_id, cwd, prd_list))
+
+    assert afk_loop.get_notifications(project_id) == [{"number": 5, "title": "Top PRD"}]

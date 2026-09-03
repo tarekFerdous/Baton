@@ -1,6 +1,6 @@
 import subprocess
 
-from baton import db, session_runner
+from baton import afk_loop, db, session_runner
 from baton.web import app as app_module
 
 
@@ -205,3 +205,67 @@ def test_start_implement_records_afk_activity(client, tmp_path, monkeypatch):
     client.post("/api/session/start-implement", json={"number": 5, "title": "My PRD"})
 
     assert calls == [project_id]
+
+
+def test_afk_notifications_endpoint_reflects_the_server_side_queue(client, tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    _init_repo(root / "repo1", "https://github.com/x/repo1.git")
+    client.post("/api/settings/root-dir", json={"root_dir": str(root)})
+    project_id = client.get("/api/app-state").json()["projects"][0]["id"]
+    client.post(f"/api/projects/{project_id}/open")
+
+    assert client.get(f"/api/projects/{project_id}/afk-notifications").json() == {"notifications": []}
+
+    afk_loop.add_notification(project_id, 5, "Top PRD")
+    afk_loop.add_notification(project_id, 6, "Second PRD")
+
+    resp = client.get(f"/api/projects/{project_id}/afk-notifications")
+    assert resp.json() == {
+        "notifications": [
+            {"number": 5, "title": "Top PRD"},
+            {"number": 6, "title": "Second PRD"},
+        ]
+    }
+
+
+def test_dismiss_afk_notifications_clears_the_queue(client, tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    _init_repo(root / "repo1", "https://github.com/x/repo1.git")
+    client.post("/api/settings/root-dir", json={"root_dir": str(root)})
+    project_id = client.get("/api/app-state").json()["projects"][0]["id"]
+    client.post(f"/api/projects/{project_id}/open")
+
+    afk_loop.add_notification(project_id, 5, "Top PRD")
+
+    resp = client.post(f"/api/projects/{project_id}/afk-notifications/dismiss")
+    assert resp.json() == {"dismissed": True}
+
+    assert client.get(f"/api/projects/{project_id}/afk-notifications").json() == {"notifications": []}
+
+
+def test_dismiss_afk_notifications_does_not_touch_session_rows(client, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _init_repo(root / "repo1", "https://github.com/x/repo1.git")
+    client.post("/api/settings/root-dir", json={"root_dir": str(root)})
+    project_id = client.get("/api/app-state").json()["projects"][0]["id"]
+    client.post(f"/api/projects/{project_id}/open")
+
+    async def _noop_job(card_id, prd_number, *, cwd):
+        return None
+
+    monkeypatch.setattr(session_runner, "start_implement_job", _noop_job)
+
+    started = client.post("/api/session/start-implement", json={"number": 5, "title": "My PRD"})
+    card_id = started.json()["card_id"]
+
+    conn = db.get_connection()
+    before = dict(db.get_session(conn, card_id))
+
+    afk_loop.add_notification(project_id, 5, "My PRD")
+    client.post(f"/api/projects/{project_id}/afk-notifications/dismiss")
+
+    after = dict(db.get_session(conn, card_id))
+    assert after == before

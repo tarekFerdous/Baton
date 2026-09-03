@@ -265,6 +265,17 @@ def list_sessions(project_id: int):
     return {"sessions": [_session_to_dict(r) for r in db.list_sessions_for_project(conn, project_id)]}
 
 
+@app.get("/api/projects/{project_id}/afk-notifications")
+def get_afk_notifications(project_id: int):
+    return {"notifications": afk_loop.get_notifications(project_id)}
+
+
+@app.post("/api/projects/{project_id}/afk-notifications/dismiss")
+def dismiss_afk_notifications(project_id: int):
+    afk_loop.dismiss_notifications(project_id)
+    return {"dismissed": True}
+
+
 @app.get("/api/usage")
 def get_usage():
     usage = live_stream.last_usage()

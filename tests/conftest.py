@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from baton import db, live_stream, session_runner
+from baton import afk_loop, db, live_stream, session_runner
 from baton.web import app as app_module
 
 
@@ -28,3 +28,9 @@ def _isolated_implement_queues(monkeypatch):
     per-project implement queue -- also process-lifetime-only state, keyed
     by project ids that restart at 1 in every test's fresh tmp db."""
     monkeypatch.setattr(session_runner, "_implement_queues", {})
+
+
+@pytest.fixture(autouse=True)
+def _isolated_afk_loop(monkeypatch):
+    """Same story again, but for the AFK loop's per-project idle clock."""
+    monkeypatch.setattr(afk_loop, "_last_activity", {})

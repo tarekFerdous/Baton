@@ -169,3 +169,39 @@ def test_start_implement_endpoint_rejects_duplicate_session_for_same_prd(client,
     # A different PRD number is unaffected by the first one's in-flight session.
     third = client.post("/api/session/start-implement", json={"number": 6, "title": "Other PRD"})
     assert "card_id" in third.json()
+
+
+def test_open_project_records_afk_activity(client, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _init_repo(root / "repo1", "https://github.com/x/repo1.git")
+    client.post("/api/settings/root-dir", json={"root_dir": str(root)})
+    project_id = client.get("/api/app-state").json()["projects"][0]["id"]
+
+    calls = []
+    monkeypatch.setattr(app_module.afk_loop, "record_activity", lambda pid: calls.append(pid))
+
+    client.post(f"/api/projects/{project_id}/open")
+
+    assert calls == [project_id]
+
+
+def test_start_implement_records_afk_activity(client, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _init_repo(root / "repo1", "https://github.com/x/repo1.git")
+    client.post("/api/settings/root-dir", json={"root_dir": str(root)})
+    project_id = client.get("/api/app-state").json()["projects"][0]["id"]
+    client.post(f"/api/projects/{project_id}/open")
+
+    async def _noop_job(card_id, prd_number, *, cwd):
+        return None
+
+    monkeypatch.setattr(session_runner, "start_implement_job", _noop_job)
+
+    calls = []
+    monkeypatch.setattr(app_module.afk_loop, "record_activity", lambda pid: calls.append(pid))
+
+    client.post("/api/session/start-implement", json={"number": 5, "title": "My PRD"})
+
+    assert calls == [project_id]

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import subprocess
 from contextlib import asynccontextmanager
@@ -9,7 +10,7 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from baton import db, live_stream, session_runner
+from baton import afk_loop, db, live_stream, session_runner
 from baton.cli_client import ClaudeCLIError, get_auth_status
 from baton.folder_picker import pick_folder
 from baton.prd_list import compute_prd_list
@@ -22,7 +23,17 @@ BASE_DIR = Path(__file__).parent
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     live_stream.set_loop(asyncio.get_running_loop())
+    afk_task = asyncio.create_task(
+        afk_loop.run_forever(
+            get_active_project_id=lambda: _active_project_id,
+            get_active_project_cwd=_active_project_cwd,
+            fetch_prd_list=lambda cwd: compute_prd_list(_fetch_ready_prds(cwd), _fetch_all_open_issues(cwd)),
+        )
+    )
     yield
+    afk_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await afk_task
     db.cleanup_sessions_on_shutdown(db.get_connection())
 
 
@@ -167,6 +178,7 @@ def open_project(project_id: int):
 
     db.mark_opened(conn, project_id)
     _active_project_id = project_id
+    afk_loop.record_activity(project_id)
     row = db.get_project(conn, project_id)
 
     return {
@@ -324,6 +336,7 @@ async def start_implement(body: dict):
     number = body["number"]
     title = body.get("title", "")
 
+    afk_loop.record_activity(project_id)
     return await session_runner.start_or_queue_implement(project_id, number, title, cwd)
 
 

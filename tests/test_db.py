@@ -12,6 +12,18 @@ def test_root_dir_round_trip(tmp_path):
     assert db.get_root_dir(conn) == "/other/root"
 
 
+def test_afk_hours_round_trip(tmp_path):
+    db_path = tmp_path / "baton.db"
+    conn = db.get_connection(db_path)
+    assert db.get_afk_hours(conn) == 6
+
+    db.set_afk_hours(conn, 10)
+    assert db.get_afk_hours(conn) == 10
+
+    reopened = db.get_connection(db_path)
+    assert db.get_afk_hours(reopened) == 10
+
+
 def test_project_open_close_reopen_preserves_state(tmp_path):
     conn = db.get_connection(tmp_path / "baton.db")
     db.upsert_project(conn, "/repos/foo", "foo", "main")

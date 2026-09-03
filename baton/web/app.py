@@ -91,6 +91,7 @@ def prompt_page(request: Request):
 def app_state():
     conn = db.get_connection()
     root_dir = db.get_root_dir(conn)
+    afk_hours = db.get_afk_hours(conn)
 
     active_project = None
     if _active_project_id is not None:
@@ -103,7 +104,12 @@ def app_state():
         _rescan_and_cache(conn, root_dir)
         projects = [_project_to_dict(r) for r in db.list_projects(conn)]
 
-    return {"root_dir": root_dir, "active_project": active_project, "projects": projects}
+    return {
+        "root_dir": root_dir,
+        "afk_hours": afk_hours,
+        "active_project": active_project,
+        "projects": projects,
+    }
 
 
 @app.post("/api/settings/pick-folder")
@@ -131,6 +137,14 @@ def set_root_dir(body: dict):
     projects = [_project_to_dict(r) for r in db.list_projects(conn)]
 
     return {"root_dir": new_root, "projects": projects}
+
+
+@app.post("/api/settings/afk-hours")
+def set_afk_hours(body: dict):
+    conn = db.get_connection()
+    afk_hours = body["afk_hours"]
+    db.set_afk_hours(conn, afk_hours)
+    return {"afk_hours": afk_hours}
 
 
 @app.post("/api/projects/{project_id}/open")

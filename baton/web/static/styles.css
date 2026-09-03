@@ -337,12 +337,39 @@ textarea.prompt-box:focus {
   border-color: var(--card-border);
 }
 
+.card.middle,
 .card.right {
-  flex: 1;
   display: flex;
   flex-direction: column;
   text-align: left;
   min-width: 0;
+}
+
+.card.middle {
+  flex: 1;
+}
+
+.card.right {
+  flex: 0 0 220px;
+}
+
+.console-phase {
+  font-variation-settings: "MONO" 0, "CASL" 0, "wght" 700, "slnt" 0, "CRSV" 0;
+  color: var(--fg-muted);
+  margin: 16px 0 8px;
+}
+
+.console-phase:first-child {
+  margin-top: 0;
+}
+
+.console-action {
+  color: var(--fg-muted);
+  margin: 4px 0;
+}
+
+.console-text {
+  margin: 4px 0 12px;
 }
 
 .console-title {
@@ -520,11 +547,13 @@ textarea.prompt-box:focus {
 }
 
 .session-card {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   width: 100%;
   text-align: left;
-  padding: 16px 18px;
-  border-radius: 18px;
+  padding: 10px 14px;
+  border-radius: 14px;
   border: 1px solid var(--card-border);
   font-family: inherit;
   color: var(--fg);
@@ -536,11 +565,50 @@ textarea.prompt-box:focus {
   transform: translateY(-1px);
 }
 
+.session-card-dot {
+  flex: 0 0 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.55;
+}
+
+.session-card-dot-error {
+  background: #dc2626;
+  opacity: 1;
+}
+
 .session-card-phase {
-  font-size: 0.88rem;
+  flex: 1;
+  font-size: 0.82rem;
   font-variation-settings: "MONO" 0, "CASL" 0, "wght" 650, "slnt" 0, "CRSV" 0;
-  margin: 0 0 6px;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-card-badge {
+  flex: 0 0 auto;
+  min-width: 1.4em;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(127, 127, 127, 0.15);
+  font-size: 0.72rem;
+  text-align: center;
+}
+
+.session-count {
+  color: var(--fg-muted);
+  font-size: 0.85rem;
+  font-variation-settings: "MONO" 0, "CASL" 0, "wght" 420, "slnt" 0, "CRSV" 0;
+}
+
+.usage-indicator {
+  color: var(--fg-muted);
+  font-size: 0.72rem;
+  margin: -10px 0 16px;
+  min-height: 1em;
 }
 
 #details-view {

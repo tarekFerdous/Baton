@@ -1,29 +1,26 @@
+import asyncio
 import json
-import re
 import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from baton import db
-from baton.cli_client import ClaudeCLIError, clear_session, get_auth_status, run_prompt
+from baton import db, live_stream, session_runner
+from baton.cli_client import ClaudeCLIError, get_auth_status
 from baton.folder_picker import pick_folder
 from baton.projects import scan_projects
-from baton.qa_parser import parse_grilling_response
 from baton.terminal import open_terminal_running
-
-_AUTH_FAILURE_RE = re.compile(r"auth|login|not logged in|permission denied|401|403", re.IGNORECASE)
-_DETAIL_RE = re.compile(r"\b(PRD|Issue)\s*#(\d+)\s*[:\-]\s*(.+)", re.IGNORECASE)
 
 BASE_DIR = Path(__file__).parent
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    live_stream.set_loop(asyncio.get_running_loop())
     yield
     db.cleanup_sessions_on_shutdown(db.get_connection())
 
@@ -184,74 +181,44 @@ def _session_to_dict(row) -> dict:
     }
 
 
-def _parse_details(text: str) -> dict:
-    prd = None
-    issues = []
-    for match in _DETAIL_RE.finditer(text):
-        kind, number, title = match.group(1).lower(), int(match.group(2)), match.group(3).strip()
-        if kind == "prd" and prd is None:
-            prd = {"number": number, "title": title}
-        elif kind == "issue":
-            issues.append({"number": number, "title": title})
-    return {"prd": prd, "issues": issues, "raw": text}
-
-
-def _run_phase_step(conn, row, *, phase: str, prompt: str, cwd: str) -> tuple[bool, str | None]:
-    """Run one /to-prd or /to-issues step, updating the session row. Returns (ok, claude_session_id)."""
-    db.update_session(conn, row["id"], phase=phase, error_text=None, needs_github_login=0)
-    try:
-        result = run_prompt(prompt, session_id=row["claude_session_id"], cwd=cwd)
-    except ClaudeCLIError as e:
-        message = str(e)
-        db.update_session(
-            conn,
-            row["id"],
-            error_text=message,
-            needs_github_login=1 if _AUTH_FAILURE_RE.search(message) else 0,
-        )
-        return False, None
-
-    claude_session_id = result["session_id"]
-    db.update_session(
-        conn,
-        row["id"],
-        claude_session_id=claude_session_id,
-        console_text=row["console_text"] + "\n\n" + result["result"],
-    )
-    return True, claude_session_id
-
-
-def _advance_past_grilling(conn, row, cwd: str) -> None:
-    """Grilling just finished: run /to-prd, /to-issues, then auto-/clear and pool the session."""
-    ok, claude_session_id = _run_phase_step(
-        conn, row, phase="creating_prd", prompt="/to-prd", cwd=cwd
-    )
-    if not ok:
-        return
-
-    row = db.get_session(conn, row["id"])
-    ok, claude_session_id = _run_phase_step(
-        conn, row, phase="creating_issues", prompt="/to-issues", cwd=cwd
-    )
-    if not ok:
-        return
-
-    row = db.get_session(conn, row["id"])
-    details = _parse_details(row["console_text"])
-    db.update_session(conn, row["id"], phase="details", details_json=json.dumps(details))
-
-    new_session_id = clear_session(claude_session_id, cwd=cwd)
-    db.mark_session_available(conn, row["id"], new_session_id)
-
-
 @app.get("/api/projects/{project_id}/sessions")
 def list_sessions(project_id: int):
     conn = db.get_connection()
     return {"sessions": [_session_to_dict(r) for r in db.list_sessions_for_project(conn, project_id)]}
 
 
+@app.get("/api/usage")
+def get_usage():
+    usage = live_stream.last_usage()
+    if usage is None:
+        return {"five_hour_pct": None, "seven_day_pct": None}
+    return {"five_hour_pct": usage["five_hour_pct"], "seven_day_pct": usage["seven_day_pct"]}
+
+
+@app.get("/api/sessions/{card_id}/stream")
+async def stream_session(card_id: int):
+    async def event_source():
+        # Replay the full history unconditionally -- a session can be retried
+        # after reaching `done` once already, appending a fresh run past it.
+        history, queue = live_stream.subscribe(card_id)
+        try:
+            for event in history:
+                yield f"data: {json.dumps(event)}\n\n"
+            if history and history[-1].get("type") == "done":
+                return
+            while True:
+                event = await queue.get()
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("type") == "done":
+                    return
+        finally:
+            live_stream.unsubscribe(card_id, queue)
+
+    return StreamingResponse(event_source(), media_type="text/event-stream")
+
+
 @app.post("/api/session/start")
-def start_session(body: dict):
+async def start_session(body: dict):
     project_id = _active_project_id
     cwd = _active_project_cwd()
     if project_id is None:
@@ -263,87 +230,35 @@ def start_session(body: dict):
 
     row_id = db.create_session(conn, project_id, claude_session_id=resume_id)
 
-    try:
-        result = run_prompt(f"/do {body['prompt']}", session_id=resume_id, cwd=cwd)
-    except ClaudeCLIError as e:
-        message = str(e)
-        needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
-        db.update_session(conn, row_id, error_text=message, needs_github_login=needs_login)
-        return {"card_id": row_id, "error": message, "needs_github_login": bool(needs_login)}
+    asyncio.create_task(session_runner.start_session_job(row_id, body["prompt"], cwd=cwd))
 
-    parsed = parse_grilling_response(result["result"])
-    db.update_session(
-        conn,
-        row_id,
-        claude_session_id=result["session_id"],
-        console_text=result["result"],
-        interview_json=json.dumps(parsed),
-    )
-
-    return {
-        "card_id": row_id,
-        "session_id": result["session_id"],
-        "raw": result["result"],
-        **parsed,
-    }
+    return {"card_id": row_id}
 
 
 @app.post("/api/session/continue")
-def continue_session(body: dict):
+async def continue_session(body: dict):
     conn = db.get_connection()
     row = db.get_session(conn, body["card_id"])
     if row is None:
         return {"error": "Session not found"}
 
     cwd = _active_project_cwd()
-    try:
-        result = run_prompt(body["reply"], session_id=row["claude_session_id"], cwd=cwd)
-    except ClaudeCLIError as e:
-        message = str(e)
-        needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
-        db.update_session(conn, row["id"], error_text=message, needs_github_login=needs_login)
-        return {"card_id": row["id"], "error": message, "needs_github_login": bool(needs_login)}
+    asyncio.create_task(session_runner.continue_session_job(row["id"], body["reply"], cwd=cwd))
 
-    parsed = parse_grilling_response(result["result"])
-    console_text = row["console_text"] + "\n\n" + result["result"]
-    db.update_session(
-        conn,
-        row["id"],
-        claude_session_id=result["session_id"],
-        console_text=console_text,
-        interview_json=json.dumps(parsed),
-    )
-
-    if parsed["sections"]:
-        return {"card_id": row["id"], "phase": "grilling", "raw": result["result"], **parsed}
-
-    row = db.get_session(conn, row["id"])
-    _advance_past_grilling(conn, row, cwd)
-    return _session_to_dict(db.get_session(conn, row["id"]))
+    return {"card_id": row["id"]}
 
 
 @app.post("/api/sessions/{card_id}/retry")
-def retry_session(card_id: int):
+async def retry_session(card_id: int):
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
     if row is None:
         return {"error": "Session not found"}
 
     cwd = _active_project_cwd()
-    if row["phase"] == "creating_prd":
-        _advance_past_grilling(conn, row, cwd)
-    elif row["phase"] == "creating_issues":
-        ok, claude_session_id = _run_phase_step(
-            conn, row, phase="creating_issues", prompt="/to-issues", cwd=cwd
-        )
-        if ok:
-            row = db.get_session(conn, row["id"])
-            details = _parse_details(row["console_text"])
-            db.update_session(conn, row["id"], phase="details", details_json=json.dumps(details))
-            new_session_id = clear_session(claude_session_id, cwd=cwd)
-            db.mark_session_available(conn, row["id"], new_session_id)
+    asyncio.create_task(session_runner.retry_session_job(card_id, cwd))
 
-    return _session_to_dict(db.get_session(conn, card_id))
+    return {"card_id": card_id}
 
 
 @app.post("/api/github-login")

@@ -45,8 +45,13 @@
         </div>
       </div>
     </div>
+    <div class="card middle">
+      <p class="console-title">Output</p>
+      <div class="scroll-wrap"><div id="console-output" class="console"></div></div>
+    </div>
     <div class="card right">
-      <p class="console-title">Sessions</p>
+      <p class="console-title">Sessions <span id="session-count" class="session-count"></span></p>
+      <p id="usage-indicator" class="usage-indicator"></p>
       <div class="scroll-wrap"><div id="session-queue" class="session-queue"></div></div>
     </div>
   </div>
@@ -79,6 +84,9 @@
     const currentRootDirEl = document.getElementById("current-root-dir");
     const brandHeadingEl = document.getElementById("brand-heading");
     const sessionQueueEl = document.getElementById("session-queue");
+    const consoleOutputEl = document.getElementById("console-output");
+    const sessionCountEl = document.getElementById("session-count");
+    const usageIndicatorEl = document.getElementById("usage-indicator");
     const phaseLabelEl = document.getElementById("phase-label");
     const detailsViewEl = document.getElementById("details-view");
     const sessionErrorEl = document.getElementById("session-error");
@@ -243,6 +251,19 @@
       renderQueue();
     }
 
+    async function pollSessionQueueFreshness() {
+      if (!activeProject) return;
+      const res = await fetch(`/api/projects/${activeProject.id}/sessions`);
+      const data = await res.json();
+      // The focused card's badge comes from its live stream, not this poll --
+      // a background session's badge only ever updates this way, since its
+      // events aren't being tailed while a different card is focused.
+      (data.sessions || []).forEach((s) => {
+        if (s.card_id !== leftCardId) rightCards.set(s.card_id, s);
+      });
+      renderQueue();
+    }
+
     async function closeActiveProject() {
       if (!activeProject) return;
       await fetch(`/api/projects/${activeProject.id}/close`, {
@@ -320,6 +341,121 @@
     document.getElementById("modal-pick-btn").addEventListener("click", pickRootDir);
     document.getElementById("close-project-btn").addEventListener("click", closeActiveProject);
 
+    let eventSource = null;
+    let currentTextEl = null;
+    const cardSnapshots = new Map(); // card_id -> latest {phase, interview, details, error, needs_github_login}
+
+    function appendConsoleLine(text, className) {
+      const p = document.createElement("p");
+      if (className) p.className = className;
+      p.textContent = text;
+      consoleOutputEl.appendChild(p);
+      consoleOutputEl.scrollTop = consoleOutputEl.scrollHeight;
+      return p;
+    }
+
+    function connectStream(cardId) {
+      if (eventSource) eventSource.close();
+      consoleOutputEl.innerHTML = "";
+      currentTextEl = null;
+      const es = new EventSource(`/api/sessions/${cardId}/stream`);
+      eventSource = es;
+      es.onmessage = (e) => handleStreamEvent(cardId, es, JSON.parse(e.data));
+      es.onerror = () => {
+        es.close();
+        if (eventSource === es) eventSource = null;
+      };
+    }
+
+    function handleStreamEvent(cardId, es, event) {
+      // Bookkeeping events apply to `cardId` regardless of which card is
+      // currently focused -- a minimized session keeps advancing in the
+      // background and its snapshot must stay current for when it's refocused.
+      if (event.type === "turn") {
+        applyTurn(cardId, event);
+        return;
+      }
+
+      if (event.type === "done") {
+        finishCard(cardId);
+        es.close();
+        if (eventSource === es) eventSource = null;
+        return;
+      }
+
+      if (event.type === "usage") return;
+
+      // Everything else is pure console streaming for the currently focused
+      // session -- ignore stray events from a connection that's since been replaced.
+      if (cardId !== leftCardId) return;
+
+      if (event.type === "phase") {
+        currentTextEl = null;
+        appendConsoleLine(headingForPhase(event.phase), "console-phase");
+        setHeading(headingForPhase(event.phase));
+        return;
+      }
+
+      if (event.type === "text") {
+        if (!currentTextEl) currentTextEl = appendConsoleLine("", "console-text");
+        currentTextEl.textContent += event.text;
+        consoleOutputEl.scrollTop = consoleOutputEl.scrollHeight;
+        return;
+      }
+
+      if (event.type === "action") {
+        currentTextEl = null;
+        appendConsoleLine(event.summary, "console-action");
+      }
+    }
+
+    function applyTurn(cardId, event) {
+      if (cardId === leftCardId) currentTextEl = null;
+      const snapshot = {
+        card_id: cardId,
+        phase: event.phase,
+        interview: event.interview,
+        details: event.details,
+        error: event.error,
+        needs_github_login: event.needs_github_login,
+      };
+      cardSnapshots.set(cardId, snapshot);
+
+      if (leftCardId !== cardId) return;
+
+      if (event.phase === "grilling") {
+        if (event.error) {
+          showGrillingError(event.error);
+          return;
+        }
+        currentLeftSession = { card_id: cardId, phase: "grilling", interview: event.interview };
+        renderInterview({ preamble: event.interview.preamble, sections: event.interview.sections });
+        return;
+      }
+
+      currentLeftSession = snapshot;
+      setHeading(headingForPhase(event.phase));
+      showOnly(sessionStatusEl);
+      renderSessionStatus(snapshot);
+    }
+
+    function finishCard(cardId) {
+      const snapshot = cardSnapshots.get(cardId);
+      if (!snapshot) return;
+
+      rightCards.set(cardId, snapshot);
+      if (leftCardId === cardId) {
+        leftCardId = null;
+        currentLeftSession = null;
+        resetPromptBox();
+        startForm.style.display = "";
+        interviewEl.innerHTML = "";
+        setHeading("What are we doing?");
+        showOnly(mainFlowEl);
+      }
+      renderQueue();
+    }
+
     function renderManualReply(onSend) {
       const wrap = document.createElement("div");
       wrap.className = "manual-reply";
@@ -367,32 +503,11 @@
       const data = await res.json();
       triggerBtn.disabled = false;
 
-      if (data.error && !data.phase) {
+      if (data.error) {
         showGrillingError(data.error);
-        return;
       }
-
-      if (data.phase === "grilling" || data.sections) {
-        currentLeftSession = {
-          card_id: leftCardId,
-          phase: "grilling",
-          interview: { preamble: data.preamble, sections: data.sections },
-        };
-        renderInterview(data);
-        return;
-      }
-
-      // Grilling finished: minimize this card to the right queue and free the left card.
-      rightCards.set(leftCardId, data);
-      leftCardId = null;
-      currentLeftSession = null;
-      renderQueue();
-
-      resetPromptBox();
-      startForm.style.display = "";
-      interviewEl.innerHTML = "";
-      setHeading("What are we doing?");
-      showOnly(mainFlowEl);
+      // Otherwise, the reply's effect (next questions, or hand-off to the next
+      // phase) arrives asynchronously over the already-open event stream.
     }
 
     function renderInterview(data) {
@@ -524,8 +639,20 @@
       renderSessionStatus(session);
     }
 
+    function badgeForSession(session) {
+      if (session.error) return "!";
+      if (session.phase === "details" && session.details) {
+        const count = (session.details.issues || []).length + (session.details.prd ? 1 : 0);
+        return String(count);
+      }
+      return "";
+    }
+
     function renderQueue() {
       sessionQueueEl.innerHTML = "";
+      const total = rightCards.size + (leftCardId !== null ? 1 : 0);
+      sessionCountEl.textContent = total > 0 ? `(${total})` : "";
+
       rightCards.forEach((session) => {
         const card = document.createElement("button");
         card.type = "button";
@@ -534,18 +661,22 @@
         card.style.background = `hsla(${hue}, 70%, 55%, 0.18)`;
         card.style.borderColor = `hsla(${hue}, 70%, 55%, 0.45)`;
 
-        const label = document.createElement("p");
+        const dot = document.createElement("span");
+        dot.className = "session-card-dot";
+        dot.classList.toggle("session-card-dot-error", Boolean(session.error));
+        card.appendChild(dot);
+
+        const label = document.createElement("span");
         label.className = "session-card-phase";
         label.textContent = session.error ? "Error" : phaseLabelText(session.phase);
         card.appendChild(label);
 
-        if (session.error) {
-          const err = document.createElement("p");
-          err.className = "session-error";
-          err.textContent = session.error;
-          card.appendChild(err);
-        } else if (session.phase === "details" && session.details) {
-          card.appendChild(renderDetailsList(session.details));
+        const badge = badgeForSession(session);
+        if (badge) {
+          const badgeEl = document.createElement("span");
+          badgeEl.className = "session-card-badge";
+          badgeEl.textContent = badge;
+          card.appendChild(badgeEl);
         }
 
         card.addEventListener("click", () => focusCard(session.card_id));
@@ -564,13 +695,17 @@
 
       renderLeftSession(session);
       renderQueue();
+      connectStream(cardId);
     }
 
-    retryBtn.addEventListener("click", async () => {
+    async function retryCard(cardId) {
+      await fetch(`/api/sessions/${cardId}/retry`, { method: "POST" });
+      connectStream(cardId);
+    }
+
+    retryBtn.addEventListener("click", () => {
       if (leftCardId === null) return;
-      const res = await fetch(`/api/sessions/${leftCardId}/retry`, { method: "POST" });
-      const data = await res.json();
-      renderLeftSession(data);
+      retryCard(leftCardId);
     });
 
     githubLoginBtn.addEventListener("click", async () => {
@@ -586,8 +721,7 @@
         if (!logged_in) return;
         clearInterval(interval);
         if (leftCardId !== cardId) return;
-        const retryRes = await fetch(`/api/sessions/${cardId}/retry`, { method: "POST" });
-        renderLeftSession(await retryRes.json());
+        retryCard(cardId);
       }, 3000);
     }
 
@@ -608,15 +742,26 @@
         return;
       }
       leftCardId = data.card_id;
-      currentLeftSession = {
-        card_id: data.card_id,
-        phase: "grilling",
-        interview: { preamble: data.preamble, sections: data.sections },
-      };
+      currentLeftSession = { card_id: data.card_id, phase: "grilling", interview: { preamble: "", sections: [] } };
       startForm.style.display = "none";
       setHeading(headingForPhase("grilling"));
-      renderInterview(data);
+      renderInterview({ preamble: "", sections: [] });
+      connectStream(data.card_id);
     });
+
+    async function refreshUsage() {
+      const res = await fetch("/api/usage");
+      const data = await res.json();
+      if (data.five_hour_pct == null && data.seven_day_pct == null) {
+        usageIndicatorEl.textContent = "";
+        return;
+      }
+      const fmt = (v) => (v == null ? "—" : `${Math.round(v)}%`);
+      usageIndicatorEl.textContent = `5h ${fmt(data.five_hour_pct)} · 7d ${fmt(data.seven_day_pct)}`;
+    }
+    setInterval(refreshUsage, 8000);
+    refreshUsage();
+    setInterval(pollSessionQueueFreshness, 4000);
 
     loadAppState();
   </script>

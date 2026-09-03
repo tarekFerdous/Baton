@@ -17,8 +17,14 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     path = db_path or DEFAULT_DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(path)
+    # Concurrent sessions each open their own connection (sqlite3 connections
+    # aren't shareable across threads) and can write around the same time --
+    # WAL lets readers and a writer proceed together, and busy_timeout makes
+    # a writer wait out a brief conflict instead of raising "database is locked".
+    conn = sqlite3.connect(path, timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS settings (

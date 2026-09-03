@@ -1,10 +1,9 @@
+import asyncio
+import json
 import subprocess
 
-import pytest
-
-from baton import db
+from baton import db, live_stream, session_runner
 from baton.cli_client import ClaudeCLIError
-from baton.web import app as app_module
 
 
 def _init_repo(path, remote_url):
@@ -24,161 +23,317 @@ def _open_project(client, tmp_path, name):
     return project_id
 
 
-def test_start_session_returns_card_with_grilling_questions(client, tmp_path, monkeypatch):
-    _open_project(client, tmp_path, "proj")
+def _cwd_for(project_id):
+    conn = db.get_connection()
+    return db.get_project(conn, project_id)["path"]
 
+
+def _result_event(text, session_id="s1"):
+    return {"type": "result", "subtype": "success", "is_error": False, "result": text, "session_id": session_id}
+
+
+def test_start_session_job_publishes_usage_from_a_rate_limit_event(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    rate_limit_event = {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "unifiedWindows": {
+                "five_hour": {"utilization": 12.5},
+                "seven_day": {"utilization": 3.1},
+            }
+        },
+    }
     monkeypatch.setattr(
-        app_module,
-        "run_prompt",
-        lambda prompt, **kw: {"session_id": "s1", "result": "- What should it do?\n- Who is it for?"},
+        session_runner,
+        "stream_prompt",
+        lambda prompt, **kw: iter([rate_limit_event, _result_event("- Only question?")]),
     )
 
-    resp = client.post("/api/session/start", json={"prompt": "a new feature"})
-    data = resp.json()
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
-    assert data["card_id"] is not None
-    assert data["session_id"] == "s1"
-    assert len(data["sections"]) == 1
-    assert len(data["sections"][0]["questions"]) == 2
+    events = live_stream._buffers.get(row_id, [])
+    assert {"type": "usage", "five_hour_pct": 12.5, "seven_day_pct": 3.1} in events
+    assert live_stream.last_usage() == {"type": "usage", "five_hour_pct": 12.5, "seven_day_pct": 3.1}
 
 
-def test_continue_session_advances_through_prd_and_issues_to_details(client, tmp_path, monkeypatch):
-    _open_project(client, tmp_path, "proj")
+def test_two_sessions_advance_concurrently_without_cross_contamination(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    row_a = db.create_session(conn, project_id)
+    row_b = db.create_session(conn, project_id)
+
+    def fake_stream_prompt(prompt, **kw):
+        if prompt == "/do feature A":
+            return iter([_result_event("- Question A?", session_id="sA")])
+        if prompt == "/do feature B":
+            return iter([_result_event("- Question B?", session_id="sB")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
+
+    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
+
+    async def run_both():
+        await asyncio.gather(
+            session_runner.start_session_job(row_a, "feature A", cwd=cwd),
+            session_runner.start_session_job(row_b, "feature B", cwd=cwd),
+        )
+
+    asyncio.run(run_both())
+
+    row_a_data = db.get_session(conn, row_a)
+    row_b_data = db.get_session(conn, row_b)
+    assert row_a_data["claude_session_id"] == "sA"
+    assert row_b_data["claude_session_id"] == "sB"
+
+    interview_a = json.loads(row_a_data["interview_json"])
+    interview_b = json.loads(row_b_data["interview_json"])
+    assert interview_a["sections"][0]["questions"][0]["text"] == "Question A?"
+    assert interview_b["sections"][0]["questions"][0]["text"] == "Question B?"
+
+    events_a = live_stream._buffers.get(row_a, [])
+    events_b = live_stream._buffers.get(row_b, [])
+    assert any(e["type"] == "turn" and e["interview"] == interview_a for e in events_a)
+    assert any(e["type"] == "turn" and e["interview"] == interview_b for e in events_b)
+    # Neither session's buffer leaked the other's content.
+    assert not any("Question B" in json.dumps(e) for e in events_a)
+    assert not any("Question A" in json.dumps(e) for e in events_b)
+
+
+def test_no_cap_on_the_number_of_sessions_running_at_once(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    row_ids = [db.create_session(conn, project_id) for _ in range(8)]
 
     monkeypatch.setattr(
-        app_module,
-        "run_prompt",
-        lambda prompt, **kw: {"session_id": "s1", "result": "- First question?"},
+        session_runner,
+        "stream_prompt",
+        lambda prompt, **kw: iter([_result_event(f"- {prompt}?", session_id=prompt)]),
     )
-    card_id = client.post("/api/session/start", json={"prompt": "a feature"}).json()["card_id"]
 
-    def fake_run_prompt(prompt, **kw):
+    async def run_all():
+        await asyncio.gather(
+            *[session_runner.start_session_job(row_id, f"feature {i}", cwd=cwd) for i, row_id in enumerate(row_ids)]
+        )
+
+    asyncio.run(run_all())
+
+    for i, row_id in enumerate(row_ids):
+        row = db.get_session(conn, row_id)
+        assert row["claude_session_id"] == f"/do feature {i}"
+        interview = json.loads(row["interview_json"])
+        assert interview["sections"][0]["questions"][0]["text"] == f"/do feature {i}?"
+
+
+def test_start_session_job_returns_card_with_grilling_questions(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    monkeypatch.setattr(
+        session_runner,
+        "stream_prompt",
+        lambda prompt, **kw: iter([_result_event("- What should it do?\n- Who is it for?")]),
+    )
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+
+    asyncio.run(session_runner.start_session_job(row_id, "a new feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    interview = json.loads(row["interview_json"])
+    assert len(interview["sections"]) == 1
+    assert len(interview["sections"][0]["questions"]) == 2
+    assert row["claude_session_id"] == "s1"
+
+    events = live_stream._buffers.get(row_id, [])
+    assert {"type": "phase", "phase": "grilling"} in events
+    assert any(e["type"] == "turn" and e["interview"] == interview for e in events)
+
+
+def test_start_session_job_publishes_interview_even_with_no_structured_questions(client, tmp_path, monkeypatch):
+    """A real /do turn can reply with plain prose (no bullet/heading
+    questions qa_parser recognizes as structured). The left card must still
+    render that turn -- it must not look like nothing happened."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    monkeypatch.setattr(
+        session_runner,
+        "stream_prompt",
+        lambda prompt, **kw: iter([_result_event("Sure, tell me more about what you have in mind.")]),
+    )
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a new feature", cwd=cwd))
+
+    events = live_stream._buffers.get(row_id, [])
+    turn_events = [e for e in events if e["type"] == "turn"]
+    assert len(turn_events) == 1
+    assert turn_events[0]["interview"]["sections"] == []
+    assert turn_events[0]["interview"]["preamble"]
+
+
+def test_continue_session_job_advances_through_prd_and_issues_to_details(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    monkeypatch.setattr(
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("- First question?")])
+    )
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    def fake_stream_prompt(prompt, **kw):
         if prompt == "/to-prd":
-            return {"session_id": "s1", "result": "Published PRD #5: My PRD"}
+            return iter([_result_event("Published PRD #5: My PRD")])
         if prompt == "/to-issues":
-            return {"session_id": "s1", "result": "Issue #6: Child one\nIssue #7: Child two"}
+            return iter([_result_event("Issue #6: Child one\nIssue #7: Child two")])
         # the grilling reply itself: no more bullet/heading questions -> grilling is done
-        return {"session_id": "s1", "result": "Thanks, that's everything I need."}
+        return iter([_result_event("Thanks, that's everything I need.")])
 
-    monkeypatch.setattr(app_module, "run_prompt", fake_run_prompt)
-    monkeypatch.setattr(app_module, "clear_session", lambda session_id, cwd=None: "s2")
+    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "s2")
 
-    resp = client.post("/api/session/continue", json={"card_id": card_id, "reply": "all good"})
-    data = resp.json()
+    asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
 
-    assert data["phase"] == "details"
-    assert data["details"]["prd"] == {"number": 5, "title": "My PRD"}
-    assert data["details"]["issues"] == [
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "details"
+    details = json.loads(row["details_json"])
+    assert details["prd"] == {"number": 5, "title": "My PRD"}
+    assert details["issues"] == [
         {"number": 6, "title": "Child one"},
         {"number": 7, "title": "Child two"},
     ]
-
-    conn = db.get_connection()
-    row = db.get_session(conn, card_id)
     assert row["claude_session_id"] == "s2"
     assert row["available_for_reuse"] == 1
 
+    events = live_stream._buffers.get(row_id, [])
+    assert events[-1] == {"type": "done"}
+    assert any(e.get("type") == "turn" and e.get("phase") == "details" for e in events)
+    assert any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
+    assert "$" not in json.dumps(events)
+
 
 def test_to_prd_auth_failure_sets_error_and_needs_github_login(client, tmp_path, monkeypatch):
-    _open_project(client, tmp_path, "proj")
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
 
     monkeypatch.setattr(
-        app_module,
-        "run_prompt",
-        lambda prompt, **kw: {"session_id": "s1", "result": "- Only question?"},
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("- Only question?")])
     )
-    card_id = client.post("/api/session/start", json={"prompt": "a feature"}).json()["card_id"]
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
-    def failing_run_prompt(prompt, **kw):
+    def failing_stream_prompt(prompt, **kw):
         if prompt == "/to-prd":
             raise ClaudeCLIError("gh: not logged in, run `gh auth login`")
-        return {"session_id": "s1", "result": "Thanks, that's everything I need."}
+        return iter([_result_event("Thanks, that's everything I need.")])
 
-    monkeypatch.setattr(app_module, "run_prompt", failing_run_prompt)
+    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
 
-    resp = client.post("/api/session/continue", json={"card_id": card_id, "reply": "all good"})
-    data = resp.json()
+    asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
 
-    assert data["phase"] == "creating_prd"
-    assert data["needs_github_login"] is True
-    assert "not logged in" in data["error"]
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "creating_prd"
+    assert bool(row["needs_github_login"]) is True
+    assert "not logged in" in row["error_text"]
+
+    events = live_stream._buffers.get(row_id, [])
+    assert events[-1] == {"type": "done"}
 
 
 def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypatch):
-    _open_project(client, tmp_path, "proj")
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
 
     monkeypatch.setattr(
-        app_module,
-        "run_prompt",
-        lambda prompt, **kw: {"session_id": "s1", "result": "- Only question?"},
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("- Only question?")])
     )
-    card_id = client.post("/api/session/start", json={"prompt": "a feature"}).json()["card_id"]
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
-    monkeypatch.setattr(
-        app_module,
-        "run_prompt",
-        lambda prompt, **kw: (_ for _ in ()).throw(ClaudeCLIError("not logged in"))
-        if prompt == "/to-prd"
-        else {"session_id": "s1", "result": "done"},
-    )
-    client.post("/api/session/continue", json={"card_id": card_id, "reply": "all good"})
-
-    def fake_run_prompt(prompt, **kw):
+    def failing_stream_prompt(prompt, **kw):
         if prompt == "/to-prd":
-            return {"session_id": "s1", "result": "PRD #9: Retried PRD"}
+            raise ClaudeCLIError("not logged in")
+        return iter([_result_event("done")])
+
+    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
+    asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
+
+    def fake_stream_prompt(prompt, **kw):
+        if prompt == "/to-prd":
+            return iter([_result_event("PRD #9: Retried PRD")])
         if prompt == "/to-issues":
-            return {"session_id": "s1", "result": "Issue #10: Only child"}
-        return {"session_id": "s1", "result": "done"}
+            return iter([_result_event("Issue #10: Only child")])
+        return iter([_result_event("done")])
 
-    monkeypatch.setattr(app_module, "run_prompt", fake_run_prompt)
-    monkeypatch.setattr(app_module, "clear_session", lambda session_id, cwd=None: "s2")
+    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "s2")
 
-    resp = client.post(f"/api/sessions/{card_id}/retry")
-    data = resp.json()
+    asyncio.run(session_runner.retry_session_job(row_id, cwd))
 
-    assert data["phase"] == "details"
-    assert data["error"] is None
-    assert data["details"]["prd"] == {"number": 9, "title": "Retried PRD"}
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "details"
+    assert row["error_text"] is None
+    details = json.loads(row["details_json"])
+    assert details["prd"] == {"number": 9, "title": "Retried PRD"}
 
 
 def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch):
     project_a = _open_project(client, tmp_path, "proj_a")
+    cwd_a = _cwd_for(project_a)
 
     monkeypatch.setattr(
-        app_module,
-        "run_prompt",
-        lambda prompt, **kw: {"session_id": "s1", "result": "- Only question?"},
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("- Only question?")])
     )
-    card_id = client.post("/api/session/start", json={"prompt": "a feature"}).json()["card_id"]
-
-    monkeypatch.setattr(
-        app_module,
-        "run_prompt",
-        lambda prompt, **kw: {"session_id": "s1", "result": f"PRD #1: p\nIssue #2: i"}
-        if prompt in ("/to-prd", "/to-issues")
-        else {"session_id": "s1", "result": "done"},
-    )
-    monkeypatch.setattr(app_module, "clear_session", lambda session_id, cwd=None: "pooled-session")
-    client.post("/api/session/continue", json={"card_id": card_id, "reply": "all good"})
-
     conn = db.get_connection()
-    row = db.get_session(conn, card_id)
+    row_id = db.create_session(conn, project_a)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd_a))
+
+    def fake_stream_prompt(prompt, **kw):
+        if prompt in ("/to-prd", "/to-issues"):
+            return iter([_result_event("PRD #1: p\nIssue #2: i")])
+        return iter([_result_event("done")])
+
+    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "pooled-session")
+    asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd_a))
+
+    row = db.get_session(conn, row_id)
     assert row["available_for_reuse"] == 1
     assert row["claude_session_id"] == "pooled-session"
 
     seen_session_ids = []
 
-    def recording_run_prompt(prompt, *, session_id=None, cwd=None, model=None):
+    def recording_stream_prompt(prompt, *, session_id=None, cwd=None, model=None):
         seen_session_ids.append(session_id)
-        return {"session_id": "new", "result": "- Another question?"}
+        return iter([_result_event("- Another question?", session_id="new")])
 
-    monkeypatch.setattr(app_module, "run_prompt", recording_run_prompt)
+    monkeypatch.setattr(session_runner, "stream_prompt", recording_stream_prompt)
 
     # Same project: should resume the pooled session.
-    client.post("/api/session/start", json={"prompt": "another feature"})
+    reused = db.claim_available_session(conn, project_a)
+    resume_id = reused["claude_session_id"] if reused is not None else None
+    new_row_id = db.create_session(conn, project_a, claude_session_id=resume_id)
+    asyncio.run(session_runner.start_session_job(new_row_id, "another feature", cwd=cwd_a))
     assert seen_session_ids[-1] == "pooled-session"
 
     # A different project must never be handed project A's pooled session.
-    _open_project(client, tmp_path, "proj_b")
-    client.post("/api/session/start", json={"prompt": "unrelated feature"})
+    project_b = _open_project(client, tmp_path, "proj_b")
+    cwd_b = _cwd_for(project_b)
+    reused_b = db.claim_available_session(conn, project_b)
+    resume_id_b = reused_b["claude_session_id"] if reused_b is not None else None
+    row_id_b = db.create_session(conn, project_b, claude_session_id=resume_id_b)
+    asyncio.run(session_runner.start_session_job(row_id_b, "unrelated feature", cwd=cwd_b))
     assert seen_session_ids[-1] is None

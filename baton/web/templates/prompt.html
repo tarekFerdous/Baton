@@ -71,6 +71,11 @@
       <label for="afk-hours-input" class="modal-field-label">Hours until self-implement (AFK)</label>
       <input id="afk-hours-input" class="modal-number-input" type="number" min="1" step="1" />
 
+      <label class="modal-checkbox-label">
+        <input id="parallel-implementation-toggle" type="checkbox" class="modal-checkbox-input" />
+        Run implementations in parallel
+      </label>
+
       <button id="modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
     </div>
   </div>
@@ -93,6 +98,7 @@
     const settingsModalEl = document.getElementById("settings-modal");
     const currentRootDirEl = document.getElementById("current-root-dir");
     const afkHoursInputEl = document.getElementById("afk-hours-input");
+    const parallelImplementationToggleEl = document.getElementById("parallel-implementation-toggle");
     const brandHeadingEl = document.getElementById("brand-heading");
     const sessionQueueEl = document.getElementById("session-queue");
     const consoleOutputEl = document.getElementById("console-output");
@@ -109,6 +115,7 @@
 
     let knownRootDir = null;
     let knownAfkHours = null;
+    let knownParallelImplementation = null;
 
     function autoGrow(el) {
       el.style.height = "auto";
@@ -283,6 +290,11 @@
     // member of this set. Recomputed from the fetched session list every
     // time sessions are (re)loaded, not just from an optimistic click.
     let implementingPrdNumbers = new Set();
+    // PRD numbers queued (serial mode) behind a currently-implementing
+    // session -- nothing has started for them yet, but a second click must
+    // still be blocked. Cleared for a number once it actually shows up in
+    // implementingPrdNumbers (its queued turn came up and it started).
+    let queuedPrdNumbers = new Set();
     let lastPrds = [];
 
     function computeImplementingPrdNumbers(sessions) {
@@ -305,8 +317,15 @@
 
     function refreshImplementingPrdNumbers(sessions) {
       const next = computeImplementingPrdNumbers(sessions);
-      if (!sameNumberSet(next, implementingPrdNumbers)) {
-        implementingPrdNumbers = next;
+      const changed = !sameNumberSet(next, implementingPrdNumbers);
+      implementingPrdNumbers = next;
+      // A queued PRD stops being "queued" the moment its turn comes up and
+      // it actually starts implementing.
+      let queuedChanged = false;
+      implementingPrdNumbers.forEach((number) => {
+        if (queuedPrdNumbers.delete(number)) queuedChanged = true;
+      });
+      if (changed || queuedChanged) {
         renderPrdList(lastPrds);
       }
     }
@@ -337,6 +356,14 @@
         return;
       }
 
+      if (data.queued) {
+        // Nothing started yet -- just mark it pending so a second click
+        // can't also queue it, and re-render so its button reflects that.
+        queuedPrdNumbers.add(prd.number);
+        renderPrdList(lastPrds);
+        return;
+      }
+
       implementingPrdNumbers.add(prd.number);
       cardSessionTypes.set(data.card_id, "implement");
       rightCards.set(data.card_id, {
@@ -362,9 +389,11 @@
         btn.textContent = `PRD: ${prd.number}`;
 
         const implementing = implementingPrdNumbers.has(prd.number);
+        const queued = queuedPrdNumbers.has(prd.number);
         if (implementing) btn.classList.add("prd-btn-implementing");
+        else if (queued) btn.classList.add("prd-btn-queued");
 
-        if (prd.blocked || implementing) {
+        if (prd.blocked || implementing || queued) {
           btn.disabled = true;
         } else {
           btn.addEventListener("click", () => startImplementSession(prd, btn));
@@ -423,6 +452,7 @@
       const state = await res.json();
       knownRootDir = state.root_dir;
       knownAfkHours = state.afk_hours;
+      knownParallelImplementation = state.parallel_implementation;
 
       if (state.active_project) {
         await activateProject(state.active_project);
@@ -441,6 +471,7 @@
     function openSettingsModal() {
       currentRootDirEl.textContent = knownRootDir || "No directory set.";
       afkHoursInputEl.value = knownAfkHours ?? 6;
+      parallelImplementationToggleEl.checked = knownParallelImplementation ?? true;
       settingsModalEl.hidden = false;
     }
 
@@ -463,6 +494,18 @@
       const data = await res.json();
       knownAfkHours = data.afk_hours;
       afkHoursInputEl.value = knownAfkHours;
+    }
+
+    async function updateParallelImplementation() {
+      const value = parallelImplementationToggleEl.checked;
+      const res = await fetch("/api/settings/parallel-implementation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ parallel_implementation: value }),
+      });
+      const data = await res.json();
+      knownParallelImplementation = data.parallel_implementation;
+      parallelImplementationToggleEl.checked = knownParallelImplementation;
     }
 
     async function pickRootDir() {
@@ -493,6 +536,7 @@
     document.getElementById("modal-close-btn").addEventListener("click", closeSettingsModal);
     document.getElementById("modal-pick-btn").addEventListener("click", pickRootDir);
     afkHoursInputEl.addEventListener("change", updateAfkHours);
+    parallelImplementationToggleEl.addEventListener("change", updateParallelImplementation);
     document.getElementById("close-project-btn").addEventListener("click", closeActiveProject);
 
     let eventSource = null;

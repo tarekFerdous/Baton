@@ -22,6 +22,22 @@ from baton.stream_translate import translate_event
 _AUTH_FAILURE_RE = re.compile(r"auth|login|not logged in|permission denied|401|403", re.IGNORECASE)
 _DETAIL_RE = re.compile(r"\b(PRD|Issue)\s*#(\d+)\s*[:\-]\s*(.+)", re.IGNORECASE)
 
+# In-memory, per-project FIFO queue for serial-mode ("parallel_implementation"
+# off) PRD implementation requests. Process-lifetime only, same as
+# `_active_project_id` in app.py -- nothing here needs to survive a restart.
+_implement_queues: dict[int, list[dict]] = {}
+
+
+def _enqueue_implement(project_id: int, number: int, title: str) -> None:
+    _implement_queues.setdefault(project_id, []).append({"number": number, "title": title})
+
+
+def _pop_next_implement(project_id: int) -> dict | None:
+    queue = _implement_queues.get(project_id)
+    if not queue:
+        return None
+    return queue.pop(0)
+
 
 def parse_details(text: str) -> dict:
     prd = None
@@ -208,6 +224,55 @@ def _read_tracker_file(cwd: str | None) -> dict | None:
         return None
 
 
+def _launch_implement(conn, project_id: int, number: int, title: str, cwd: str | None) -> int:
+    """Claim a pooled session (if any), create the session row, and fire the
+    background `/implement` job -- the shared plumbing behind both an
+    immediate PRD click and a queued PRD's turn coming up in serial mode."""
+    reused = db.claim_available_session(conn, project_id)
+    resume_id = reused["claude_session_id"] if reused is not None else None
+
+    row_id = db.create_session(
+        conn,
+        project_id,
+        claude_session_id=resume_id,
+        session_type="implement",
+        phase="implementing",
+        details={"prd": {"number": number, "title": title}},
+    )
+
+    asyncio.create_task(start_implement_job(row_id, number, cwd=cwd))
+
+    return row_id
+
+
+async def start_or_queue_implement(project_id: int, number: int, title: str, cwd: str | None) -> dict:
+    """Decide whether a clicked PRD starts implementing right away or, in
+    serial mode with another implement session already live for this
+    project, gets enqueued to auto-start once that slot frees up."""
+    conn = db.get_connection()
+    if db.has_active_implement_session(conn, project_id, number):
+        return {"error": "Already implementing"}
+
+    if not db.get_parallel_implementation(conn) and db.has_any_active_implement_session(conn, project_id):
+        _enqueue_implement(project_id, number, title)
+        return {"queued": True}
+
+    card_id = _launch_implement(conn, project_id, number, title, cwd)
+    return {"card_id": card_id}
+
+
+async def _drain_implement_queue(project_id: int, cwd: str | None) -> None:
+    """Called right as a running implement session frees its "one running at
+    a time" slot (serial mode). Starts at most one queued PRD -- that job's
+    own completion will drain the one after it, in turn."""
+    entry = _pop_next_implement(project_id)
+    if entry is None:
+        return
+
+    conn = db.get_connection()
+    _launch_implement(conn, project_id, entry["number"], entry["title"], cwd)
+
+
 async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None) -> None:
     """Run a single `/implement prd: N` turn end to end: `implementing` while
     it's in flight, then `implemented` on success with details replaced by
@@ -228,6 +293,7 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
         db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
         publish(card_id, _turn_event(phase="implementing", error=message, needs_github_login=bool(needs_login)))
         publish(card_id, {"type": "done"})
+        await _drain_implement_queue(row["project_id"], cwd)
         return
 
     console_text = row["console_text"] + "\n\n" + turn["result"] if row["console_text"] else turn["result"]
@@ -251,6 +317,8 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
 
     publish(card_id, _turn_event(phase="implemented", details=details))
     publish(card_id, {"type": "done"})
+
+    await _drain_implement_queue(row["project_id"], cwd)
 
 
 async def retry_session_job(card_id: int, cwd: str | None) -> None:

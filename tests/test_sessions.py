@@ -394,6 +394,92 @@ def test_start_implement_job_error_leaves_session_in_implementing_with_error_tex
     assert events[-1] == {"type": "done"}
 
 
+def test_parallel_mode_starts_multiple_prds_immediately_without_queueing(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    async def _noop_job(card_id, prd_number, *, cwd):
+        return None
+
+    monkeypatch.setattr(session_runner, "start_implement_job", _noop_job)
+
+    # parallel_implementation defaults to True -- two different PRDs both
+    # start immediately, no queueing involved.
+    first = asyncio.run(session_runner.start_or_queue_implement(project_id, 5, "PRD Five", cwd))
+    assert "card_id" in first
+
+    second = asyncio.run(session_runner.start_or_queue_implement(project_id, 6, "PRD Six", cwd))
+    assert "card_id" in second
+
+    conn = db.get_connection()
+    sessions = db.list_sessions_for_project(conn, project_id)
+    implement_sessions = [s for s in sessions if s["session_type"] == "implement"]
+    assert len(implement_sessions) == 2
+    assert session_runner._implement_queues.get(project_id, []) == []
+
+
+def test_serial_mode_queues_second_prd_and_drains_it_when_first_finishes(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    db.set_parallel_implementation(conn, False)
+
+    # First PRD starts immediately (nothing else is running yet).
+    monkeypatch.setattr(
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("Implemented PRD #5", session_id="impl-a")])
+    )
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "pooled-a")
+
+    started = asyncio.run(session_runner.start_or_queue_implement(project_id, 5, "PRD Five", cwd))
+    row_a = started["card_id"]
+    assert row_a is not None
+
+    # A's session row is still "implementing" (its background job hasn't run
+    # yet -- it was only scheduled via asyncio.create_task).
+    assert db.get_session(conn, row_a)["phase"] == "implementing"
+
+    # Second PRD, while A is live, must queue instead of starting.
+    queued = asyncio.run(session_runner.start_or_queue_implement(project_id, 6, "PRD Six", cwd))
+    assert queued == {"queued": True}
+
+    sessions_before_drain = db.list_sessions_for_project(conn, project_id)
+    implement_sessions_before = [s for s in sessions_before_drain if s["session_type"] == "implement"]
+    assert len(implement_sessions_before) == 1
+
+    # Now run A's job for real (as its scheduled asyncio.create_task would),
+    # and let any follow-on drain task it schedules run to completion too.
+    def fake_stream_prompt(prompt, **kw):
+        if prompt == "/implement prd: 6":
+            return iter([_result_event("Implemented PRD #6", session_id="impl-b")])
+        return iter([_result_event("Implemented PRD #5", session_id="impl-a")])
+
+    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: f"pooled-{session_id}")
+
+    async def run_a_and_drain():
+        await session_runner.start_implement_job(row_a, 5, cwd=cwd)
+        # start_implement_job's own completion schedules the queue drain's
+        # follow-on job via asyncio.create_task -- let it run to completion
+        # before asserting on it, matching how this module fires background
+        # work across a job boundary.
+        pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        if pending:
+            await asyncio.gather(*pending)
+
+    asyncio.run(run_a_and_drain())
+
+    assert session_runner._implement_queues.get(project_id, []) == []
+
+    sessions_after_drain = db.list_sessions_for_project(conn, project_id)
+    implement_sessions_after = [s for s in sessions_after_drain if s["session_type"] == "implement"]
+    assert len(implement_sessions_after) == 2
+
+    row_b = next(s for s in implement_sessions_after if s["id"] != row_a)
+    assert row_b["phase"] == "implemented"
+    assert json.loads(row_b["details_json"])["prd"] == {"number": 6, "title": "PRD Six"}
+
+
 def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch):
     project_a = _open_project(client, tmp_path, "proj_a")
     cwd_a = _cwd_for(project_a)

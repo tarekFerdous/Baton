@@ -24,6 +24,23 @@ def test_set_afk_hours_persists_and_reflects_in_app_state(client):
     assert state["afk_hours"] == 12
 
 
+def test_app_state_defaults_parallel_implementation_to_true(client):
+    state = client.get("/api/app-state").json()
+    assert state["parallel_implementation"] is True
+
+
+def test_set_parallel_implementation_persists_and_reflects_in_app_state(client):
+    resp = client.post("/api/settings/parallel-implementation", json={"parallel_implementation": False})
+    assert resp.json() == {"parallel_implementation": False}
+
+    state = client.get("/api/app-state").json()
+    assert state["parallel_implementation"] is False
+
+    resp = client.post("/api/settings/parallel-implementation", json={"parallel_implementation": True})
+    assert resp.json() == {"parallel_implementation": True}
+    assert client.get("/api/app-state").json()["parallel_implementation"] is True
+
+
 def test_root_dir_change_without_confirmation_leaves_projects_untouched(client, tmp_path):
     root_a = tmp_path / "root_a"
     root_a.mkdir()

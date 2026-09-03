@@ -92,6 +92,7 @@ def app_state():
     conn = db.get_connection()
     root_dir = db.get_root_dir(conn)
     afk_hours = db.get_afk_hours(conn)
+    parallel_implementation = db.get_parallel_implementation(conn)
 
     active_project = None
     if _active_project_id is not None:
@@ -107,6 +108,7 @@ def app_state():
     return {
         "root_dir": root_dir,
         "afk_hours": afk_hours,
+        "parallel_implementation": parallel_implementation,
         "active_project": active_project,
         "projects": projects,
     }
@@ -145,6 +147,14 @@ def set_afk_hours(body: dict):
     afk_hours = body["afk_hours"]
     db.set_afk_hours(conn, afk_hours)
     return {"afk_hours": afk_hours}
+
+
+@app.post("/api/settings/parallel-implementation")
+def set_parallel_implementation(body: dict):
+    conn = db.get_connection()
+    parallel_implementation = bool(body["parallel_implementation"])
+    db.set_parallel_implementation(conn, parallel_implementation)
+    return {"parallel_implementation": parallel_implementation}
 
 
 @app.post("/api/projects/{project_id}/open")
@@ -314,25 +324,7 @@ async def start_implement(body: dict):
     number = body["number"]
     title = body.get("title", "")
 
-    conn = db.get_connection()
-    if db.has_active_implement_session(conn, project_id, number):
-        return {"error": "Already implementing"}
-
-    reused = db.claim_available_session(conn, project_id)
-    resume_id = reused["claude_session_id"] if reused is not None else None
-
-    row_id = db.create_session(
-        conn,
-        project_id,
-        claude_session_id=resume_id,
-        session_type="implement",
-        phase="implementing",
-        details={"prd": {"number": number, "title": title}},
-    )
-
-    asyncio.create_task(session_runner.start_implement_job(row_id, number, cwd=cwd))
-
-    return {"card_id": row_id}
+    return await session_runner.start_or_queue_implement(project_id, number, title, cwd)
 
 
 @app.post("/api/sessions/{card_id}/retry")

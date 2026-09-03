@@ -26,6 +26,21 @@ def test_afk_hours_round_trip(tmp_path):
     assert db.get_afk_hours(reopened) == 10
 
 
+def test_parallel_implementation_round_trip(tmp_path):
+    db_path = tmp_path / "baton.db"
+    conn = db.get_connection(db_path)
+    assert db.get_parallel_implementation(conn) is True
+
+    db.set_parallel_implementation(conn, False)
+    assert db.get_parallel_implementation(conn) is False
+
+    reopened = db.get_connection(db_path)
+    assert db.get_parallel_implementation(reopened) is False
+
+    db.set_parallel_implementation(reopened, True)
+    assert db.get_parallel_implementation(reopened) is True
+
+
 def test_project_open_close_reopen_preserves_state(tmp_path):
     conn = db.get_connection(tmp_path / "baton.db")
     db.upsert_project(conn, "/repos/foo", "foo", "main")
@@ -131,6 +146,32 @@ def test_has_active_implement_session_ignores_terminal_or_errored_sessions(tmp_p
     db.update_session(conn, errored_id, error_text="boom")
 
     assert db.has_active_implement_session(conn, project_id=1, prd_number=4) is False
+
+
+def test_has_any_active_implement_session_ignores_prd_number(tmp_path):
+    conn = db.get_connection(tmp_path / "baton.db")
+    assert db.has_any_active_implement_session(conn, project_id=1) is False
+
+    db.create_session(
+        conn, project_id=1, session_type="implement", phase="implementing", details={"prd": {"number": 9, "title": "X"}}
+    )
+
+    # True regardless of which PRD number the live session is for.
+    assert db.has_any_active_implement_session(conn, project_id=1) is True
+    assert db.has_any_active_implement_session(conn, project_id=2) is False
+
+
+def test_has_any_active_implement_session_ignores_terminal_or_errored_sessions(tmp_path):
+    conn = db.get_connection(tmp_path / "baton.db")
+    db.create_session(
+        conn, project_id=1, session_type="implement", phase="implemented", details={"prd": {"number": 4, "title": "Y"}}
+    )
+    errored_id = db.create_session(
+        conn, project_id=1, session_type="implement", phase="implementing", details={"prd": {"number": 4, "title": "Y"}}
+    )
+    db.update_session(conn, errored_id, error_text="boom")
+
+    assert db.has_any_active_implement_session(conn, project_id=1) is False
 
 
 def test_cleanup_sessions_on_shutdown_keeps_only_most_recently_used(tmp_path):

@@ -39,6 +39,10 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(settings)")}
     if "afk_hours" not in existing_columns:
         conn.execute("ALTER TABLE settings ADD COLUMN afk_hours INTEGER NOT NULL DEFAULT 6")
+    if "parallel_implementation" not in existing_columns:
+        conn.execute(
+            "ALTER TABLE settings ADD COLUMN parallel_implementation INTEGER NOT NULL DEFAULT 1"
+        )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS projects (
@@ -107,6 +111,22 @@ def set_afk_hours(conn: sqlite3.Connection, hours: int) -> None:
         ON CONFLICT(id) DO UPDATE SET afk_hours = excluded.afk_hours
         """,
         (hours,),
+    )
+    conn.commit()
+
+
+def get_parallel_implementation(conn: sqlite3.Connection) -> bool:
+    row = conn.execute("SELECT parallel_implementation FROM settings WHERE id = 1").fetchone()
+    return bool(row["parallel_implementation"]) if row else True
+
+
+def set_parallel_implementation(conn: sqlite3.Connection, value: bool) -> None:
+    conn.execute(
+        """
+        INSERT INTO settings (id, parallel_implementation) VALUES (1, ?)
+        ON CONFLICT(id) DO UPDATE SET parallel_implementation = excluded.parallel_implementation
+        """,
+        (1 if value else 0,),
     )
     conn.commit()
 
@@ -255,6 +275,21 @@ def has_active_implement_session(conn: sqlite3.Connection, project_id: int, prd_
         if prd and prd.get("number") == prd_number:
             return True
     return False
+
+
+def has_any_active_implement_session(conn: sqlite3.Connection, project_id: int) -> bool:
+    """True if this project has any live (non-terminal) implement session at
+    all, regardless of which PRD number it's for -- used to gate serial-mode
+    queueing (`parallel_implementation = False`)."""
+    row = conn.execute(
+        """
+        SELECT 1 FROM sessions
+        WHERE project_id = ? AND session_type = 'implement' AND phase = 'implementing' AND error_text IS NULL
+        LIMIT 1
+        """,
+        (project_id,),
+    ).fetchone()
+    return row is not None
 
 
 def cleanup_sessions_on_shutdown(conn: sqlite3.Connection) -> None:

@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from baton import db, live_stream
+from baton import db, live_stream, session_runner
 from baton.web import app as app_module
 
 
@@ -20,3 +20,11 @@ def _isolated_live_stream(monkeypatch):
     monkeypatch.setattr(live_stream, "_buffers", {})
     monkeypatch.setattr(live_stream, "_subscribers", {})
     monkeypatch.setattr(live_stream, "_last_usage", None)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_implement_queues(monkeypatch):
+    """Same story as `_isolated_live_stream` above, but for the serial-mode
+    per-project implement queue -- also process-lifetime-only state, keyed
+    by project ids that restart at 1 in every test's fresh tmp db."""
+    monkeypatch.setattr(session_runner, "_implement_queues", {})

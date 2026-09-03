@@ -8,6 +8,7 @@
 </head>
 <body>
   <div class="split">
+    <div class="left-column">
     <div class="card left">
       <button id="settings-gear" class="gear-btn" type="button" title="Settings">&#9881;</button>
       <h1 class="brand" id="brand-heading">What are we doing?</h1>
@@ -44,6 +45,11 @@
           <button id="retry-btn" class="glass-btn" type="button">Retry</button>
         </div>
       </div>
+    </div>
+    <div id="prd-card" class="card left-secondary" hidden>
+      <p class="console-title">To be implemented</p>
+      <div class="scroll-wrap scroll-wrap-horizontal"><div id="prd-button-row" class="prd-button-row"></div></div>
+    </div>
     </div>
     <div class="card middle">
       <p class="console-title">Output</p>
@@ -93,6 +99,8 @@
     const sessionErrorActionsEl = document.getElementById("session-error-actions");
     const githubLoginBtn = document.getElementById("github-login-btn");
     const retryBtn = document.getElementById("retry-btn");
+    const prdCardEl = document.getElementById("prd-card");
+    const prdButtonRowEl = document.getElementById("prd-button-row");
 
     let knownRootDir = null;
 
@@ -112,12 +120,14 @@
     function initScrollWrap(wrap) {
       const target = wrap.firstElementChild;
       if (!target) return;
+      const horizontal = wrap.classList.contains("scroll-wrap-horizontal");
 
       function ensurePill() {
         let pill = wrap.querySelector(".scroll-pill");
         if (!pill) {
           pill = document.createElement("div");
           pill.className = "scroll-pill";
+          if (horizontal) pill.classList.add("scroll-pill-horizontal");
           wrap.appendChild(pill);
         }
         return pill;
@@ -125,6 +135,21 @@
 
       function update() {
         const pill = ensurePill();
+        if (horizontal) {
+          const { scrollLeft, scrollWidth, clientWidth } = target;
+          if (scrollWidth <= clientWidth + 1) {
+            pill.classList.remove("visible");
+            return;
+          }
+          const pillWidth = Math.max((clientWidth / scrollWidth) * clientWidth, 24);
+          const maxLeft = clientWidth - pillWidth;
+          const left = (scrollLeft / (scrollWidth - clientWidth)) * maxLeft;
+          pill.style.width = `${pillWidth}px`;
+          pill.style.left = `${left}px`;
+          pill.classList.add("visible");
+          return;
+        }
+
         const { scrollTop, scrollHeight, clientHeight } = target;
         if (scrollHeight <= clientHeight + 1) {
           pill.classList.remove("visible");
@@ -240,6 +265,7 @@
       showOnly(mainFlowEl);
 
       await loadSessionQueue();
+      await loadPrdList();
     }
 
     async function loadSessionQueue() {
@@ -249,6 +275,25 @@
       rightCards.clear();
       (data.sessions || []).forEach((s) => rightCards.set(s.card_id, s));
       renderQueue();
+    }
+
+    function renderPrdList(prds) {
+      prdButtonRowEl.innerHTML = "";
+      prdCardEl.hidden = prds.length === 0;
+      prds.forEach((prd) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "prd-btn";
+        btn.textContent = `PRD: ${prd.number}`;
+        prdButtonRowEl.appendChild(btn);
+      });
+    }
+
+    async function loadPrdList() {
+      if (!activeProject) return;
+      const res = await fetch(`/api/projects/${activeProject.id}/prds`);
+      const data = await res.json();
+      renderPrdList(data.prds || []);
     }
 
     async function pollSessionQueueFreshness() {
@@ -280,6 +325,8 @@
       startForm.style.display = "";
       interviewEl.innerHTML = "";
       activeProjectLineEl.hidden = true;
+      prdButtonRowEl.innerHTML = "";
+      prdCardEl.hidden = true;
 
       await loadAppState();
     }
@@ -762,6 +809,7 @@
     setInterval(refreshUsage, 8000);
     refreshUsage();
     setInterval(pollSessionQueueFreshness, 4000);
+    setInterval(loadPrdList, 30000);
 
     loadAppState();
   </script>

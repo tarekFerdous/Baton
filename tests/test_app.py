@@ -1,5 +1,7 @@
 import subprocess
 
+from baton.web import app as app_module
+
 
 def _init_repo(path, remote_url):
     path.mkdir()
@@ -67,3 +69,41 @@ def test_project_open_close_reopen_round_trip(client, tmp_path):
 
     reopened = client.post(f"/api/projects/{project_id}/open").json()
     assert reopened["session_state"] == {"session_id": "abc", "console_text": "hi"}
+
+
+def test_prds_endpoint_returns_sorted_blockage_annotated_list(client, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _init_repo(root / "repo1", "https://github.com/x/repo1.git")
+    client.post("/api/settings/root-dir", json={"root_dir": str(root)})
+    project_id = client.get("/api/app-state").json()["projects"][0]["id"]
+    client.post(f"/api/projects/{project_id}/open")
+
+    prds = [
+        {"number": 34, "title": "AFK feature", "body": "", "labels": []},
+        {"number": 30, "title": "Grilling fix", "body": "", "labels": []},
+    ]
+    all_open_issues = [
+        {"number": 31, "title": "child", "body": "## Parent\n\n#30\n\n## Blocked by\n\nNone - can start immediately.\n"},
+        {
+            "number": 35,
+            "title": "child",
+            "body": "## Parent\n\n#34\n\n## Blocked by\n\n- #99\n",
+        },
+        {"number": 99, "title": "blocker", "body": "## Blocked by\n\nNone - can start immediately.\n"},
+    ]
+    monkeypatch.setattr(app_module, "_fetch_ready_prds", lambda cwd: prds)
+    monkeypatch.setattr(app_module, "_fetch_all_open_issues", lambda cwd: all_open_issues)
+
+    resp = client.get(f"/api/projects/{project_id}/prds")
+    assert resp.json() == {
+        "prds": [
+            {"number": 30, "title": "Grilling fix", "blocked": False},
+            {"number": 34, "title": "AFK feature", "blocked": True},
+        ]
+    }
+
+
+def test_prds_endpoint_returns_empty_for_non_active_project(client):
+    resp = client.get("/api/projects/999/prds")
+    assert resp.json() == {"prds": []}

@@ -162,13 +162,73 @@ textarea.prompt-box:focus {
   width: auto;
 }
 
-.card.left {
+.left-column {
   flex: 0 0 440px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-height: 0;
+}
+
+.card.left {
+  flex: 1;
   display: flex;
   flex-direction: column;
   text-align: left;
   min-height: 0;
   position: relative;
+  width: 100%;
+}
+
+.card.left-secondary {
+  flex: 0 0 auto;
+  width: 100%;
+  padding: 24px 28px;
+  text-align: left;
+}
+
+.card.left-secondary[hidden] {
+  display: none;
+}
+
+.prd-button-row {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.scroll-wrap-horizontal {
+  flex: none;
+}
+
+.scroll-pill-horizontal {
+  top: auto;
+  right: auto;
+  bottom: 2px;
+  left: 0;
+  width: auto;
+  height: 4px;
+}
+
+.prd-btn {
+  flex: 0 0 auto;
+  padding: 10px 18px;
+  border-radius: 16px;
+  border: 1px solid var(--card-border);
+  background: rgba(127, 127, 127, 0.06);
+  color: var(--fg);
+  font-family: inherit;
+  font-variation-settings: "MONO" 0, "CASL" 0, "wght" 600, "slnt" 0, "CRSV" 0;
+  font-size: 0.85rem;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.prd-btn:hover {
+  border-color: var(--glass-border);
+  color: var(--glass-bg);
 }
 
 .gear-btn {

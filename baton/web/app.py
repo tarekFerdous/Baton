@@ -12,6 +12,7 @@ from fastapi.templating import Jinja2Templates
 from baton import db, live_stream, session_runner
 from baton.cli_client import ClaudeCLIError, get_auth_status
 from baton.folder_picker import pick_folder
+from baton.prd_list import compute_prd_list
 from baton.projects import scan_projects
 from baton.terminal import open_terminal_running
 
@@ -166,6 +167,46 @@ def _active_project_cwd() -> str | None:
     conn = db.get_connection()
     row = db.get_project(conn, _active_project_id)
     return row["path"] if row is not None else None
+
+
+def _fetch_ready_prds(cwd: str) -> list[dict]:
+    result = subprocess.run(
+        ["gh", "issue", "list", "--state", "open", "--label", "ready-for-agent", "--json", "number,title,body,labels"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if result.returncode != 0:
+        return []
+    return json.loads(result.stdout)
+
+
+def _fetch_all_open_issues(cwd: str) -> list[dict]:
+    result = subprocess.run(
+        ["gh", "issue", "list", "--state", "open", "--json", "number,title,body"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if result.returncode != 0:
+        return []
+    return json.loads(result.stdout)
+
+
+@app.get("/api/projects/{project_id}/prds")
+def list_prds(project_id: int):
+    if project_id != _active_project_id:
+        return {"prds": []}
+
+    cwd = _active_project_cwd()
+    if cwd is None:
+        return {"prds": []}
+
+    prds = _fetch_ready_prds(cwd)
+    all_open_issues = _fetch_all_open_issues(cwd)
+    return {"prds": compute_prd_list(prds, all_open_issues)}
 
 
 def _session_to_dict(row) -> dict:

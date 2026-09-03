@@ -163,7 +163,8 @@ textarea.prompt-box:focus {
 }
 
 .left-column {
-  flex: 0 0 440px;
+  flex: 0 0 calc(25vw - 18px);
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 20px;
@@ -193,13 +194,20 @@ textarea.prompt-box:focus {
 
 .prd-button-row {
   display: flex;
+  flex-wrap: nowrap;
+  align-items: flex-start;
   gap: 10px;
+  height: 42px;
+  min-width: 0;
   overflow-x: auto;
+  overflow-y: hidden;
   padding-bottom: 4px;
 }
 
 .scroll-wrap-horizontal {
   flex: none;
+  width: 100%;
+  min-width: 0;
 }
 
 .scroll-pill-horizontal {
@@ -466,11 +474,11 @@ textarea.prompt-box:focus {
 }
 
 .card.middle {
-  flex: 1;
+  flex: 0 0 calc(60vw - 43px);
 }
 
 .card.right {
-  flex: 0 0 220px;
+  flex: 0 0 calc(15vw - 11px);
 }
 
 .console-phase {

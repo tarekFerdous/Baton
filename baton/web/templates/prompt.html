@@ -196,6 +196,19 @@
         fadeTimer = setTimeout(() => pill.classList.remove("active"), 400);
       });
 
+      if (horizontal) {
+        target.addEventListener(
+          "wheel",
+          (e) => {
+            if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+              e.preventDefault();
+              target.scrollLeft += e.deltaY;
+            }
+          },
+          { passive: false },
+        );
+      }
+
       new ResizeObserver(update).observe(target);
       new MutationObserver(update).observe(target, {
         childList: true,

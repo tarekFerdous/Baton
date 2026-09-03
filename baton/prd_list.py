@@ -43,6 +43,11 @@ def compute_prd_list(prds: list[dict], all_open_issues: list[dict]) -> list[dict
     used to find each PRD's children (via `## Parent` -> `#<prd_number>`) and
     to resolve whether a child's blockers are still open.
 
+    A `ready-for-agent`-labeled issue that itself has a `## Parent` section is
+    a child/nested issue -- e.g. `/to-issues` labels its slices the same as
+    the PRD they came from -- not a standalone PRD, so it's excluded here even
+    though the caller's `prds` list includes it.
+
     Returns `[{"number": int, "title": str, "blocked": bool}, ...]`, unblocked
     entries first, then blocked, ties broken by ascending issue number.
     """
@@ -56,6 +61,8 @@ def compute_prd_list(prds: list[dict], all_open_issues: list[dict]) -> list[dict
 
     results = []
     for prd in prds:
+        if _parent_number(prd.get("body", "")) is not None:
+            continue
         children = children_by_parent.get(prd["number"], [])
         blocked = bool(children) and not any(
             _child_is_unblocked(child.get("body", ""), open_issue_numbers) for child in children

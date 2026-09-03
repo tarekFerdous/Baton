@@ -49,7 +49,7 @@ def test_start_session_job_publishes_usage_from_a_rate_limit_event(client, tmp_p
     monkeypatch.setattr(
         session_runner,
         "stream_prompt",
-        lambda prompt, **kw: iter([rate_limit_event, _result_event("- Only question?")]),
+        lambda prompt, **kw: iter([rate_limit_event, _result_event("❓ **Q1** - **Scope**: Only question?")]),
     )
 
     conn = db.get_connection()
@@ -71,9 +71,9 @@ def test_two_sessions_advance_concurrently_without_cross_contamination(client, t
 
     def fake_stream_prompt(prompt, **kw):
         if prompt == "/do feature A":
-            return iter([_result_event("- Question A?", session_id="sA")])
+            return iter([_result_event("❓ **Q1** - **Scope**: Question A?", session_id="sA")])
         if prompt == "/do feature B":
-            return iter([_result_event("- Question B?", session_id="sB")])
+            return iter([_result_event("❓ **Q1** - **Scope**: Question B?", session_id="sB")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
     monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
@@ -115,7 +115,7 @@ def test_no_cap_on_the_number_of_sessions_running_at_once(client, tmp_path, monk
     monkeypatch.setattr(
         session_runner,
         "stream_prompt",
-        lambda prompt, **kw: iter([_result_event(f"- {prompt}?", session_id=prompt)]),
+        lambda prompt, **kw: iter([_result_event(f"❓ **Q1** - **Scope**: {prompt}?", session_id=prompt)]),
     )
 
     async def run_all():
@@ -139,7 +139,17 @@ def test_start_session_job_returns_card_with_grilling_questions(client, tmp_path
     monkeypatch.setattr(
         session_runner,
         "stream_prompt",
-        lambda prompt, **kw: iter([_result_event("- What should it do?\n- Who is it for?")]),
+        lambda prompt, **kw: iter(
+            [
+                _result_event(
+                    "❓ **Q1** - **Behavior**: What should it do?\n"
+                    "\n"
+                    "---\n"
+                    "\n"
+                    "❓ **Q2** - **Audience**: Who is it for?"
+                )
+            ]
+        ),
     )
 
     conn = db.get_connection()
@@ -187,7 +197,7 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
     cwd = _cwd_for(project_id)
 
     monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("- First question?")])
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: First question?")])
     )
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -229,7 +239,7 @@ def test_to_prd_auth_failure_sets_error_and_needs_github_login(client, tmp_path,
     cwd = _cwd_for(project_id)
 
     monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("- Only question?")])
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
     )
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -258,7 +268,7 @@ def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypa
     cwd = _cwd_for(project_id)
 
     monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("- Only question?")])
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
     )
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -383,7 +393,7 @@ def test_retry_on_creating_prd_phase_is_unaffected_by_implement_branch(client, t
     cwd = _cwd_for(project_id)
 
     monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("- Only question?")])
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
     )
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -646,7 +656,7 @@ def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch)
     cwd_a = _cwd_for(project_a)
 
     monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("- Only question?")])
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
     )
     conn = db.get_connection()
     row_id = db.create_session(conn, project_a)
@@ -669,7 +679,7 @@ def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch)
 
     def recording_stream_prompt(prompt, *, session_id=None, cwd=None, model=None):
         seen_session_ids.append(session_id)
-        return iter([_result_event("- Another question?", session_id="new")])
+        return iter([_result_event("❓ **Q1** - **Scope**: Another question?", session_id="new")])
 
     monkeypatch.setattr(session_runner, "stream_prompt", recording_stream_prompt)
 

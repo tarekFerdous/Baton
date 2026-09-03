@@ -192,6 +192,129 @@ def test_start_session_job_publishes_interview_even_with_no_structured_questions
     assert turn_events[0]["interview"]["preamble"]
 
 
+def test_continue_session_job_with_remaining_questions_does_not_auto_advance(client, tmp_path, monkeypatch):
+    """A reply that still has follow-up questions must never auto-advance --
+    this was already true before #33, but this test locks it in explicitly
+    and confirms it needs no `confirm_advance` flag."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    monkeypatch.setattr(
+        session_runner,
+        "stream_prompt",
+        lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: First question?")]),
+    )
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    def fake_stream_prompt(prompt, **kw):
+        if prompt in ("/to-prd", "/to-issues"):
+            raise AssertionError(f"chain must not run without confirm_advance, got {prompt!r}")
+        return iter([_result_event("❓ **Q1** - **Scope**: A follow-up question?")])
+
+    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
+
+    asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "grilling"
+    interview = json.loads(row["interview_json"])
+    assert interview["sections"][0]["questions"][0]["text"] == "A follow-up question?"
+
+    events = live_stream._buffers.get(row_id, [])
+    turn_events = [e for e in events if e["type"] == "turn"]
+    assert turn_events[-1]["interview"]["sections"]
+
+
+def test_continue_session_job_with_no_more_questions_does_not_auto_advance(client, tmp_path, monkeypatch):
+    """Issue #33: a reply that comes back with zero remaining questions must
+    stay in grilling and publish the wrap-up turn -- it must NOT silently
+    fire /to-prd on its own anymore."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    monkeypatch.setattr(
+        session_runner,
+        "stream_prompt",
+        lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: First question?")]),
+    )
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    def fake_stream_prompt(prompt, **kw):
+        if prompt in ("/to-prd", "/to-issues"):
+            raise AssertionError(f"chain must not run without confirm_advance, got {prompt!r}")
+        return iter([_result_event("Thanks, that's everything I need.")])
+
+    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
+
+    asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "grilling"
+    assert row["error_text"] is None
+
+    events = live_stream._buffers.get(row_id, [])
+    turn_events = [e for e in events if e["type"] == "turn"]
+    # One turn from start_session_job's first question, one from this reply.
+    assert len(turn_events) == 2
+    assert turn_events[-1]["phase"] == "grilling"
+    assert turn_events[-1]["interview"]["sections"] == []
+    assert turn_events[-1]["interview"]["preamble"]
+    assert not any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
+
+
+def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, tmp_path, monkeypatch):
+    """Issue #33: the explicit "Yes, proceed" path (confirm_advance=True)
+    must go straight to /to-prd -> /to-issues -> details, resuming the
+    session's existing claude_session_id, WITHOUT sending another grilling
+    CLI turn first."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    monkeypatch.setattr(
+        session_runner,
+        "stream_prompt",
+        lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")]),
+    )
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    seen_prompts = []
+
+    def fake_stream_prompt(prompt, **kw):
+        seen_prompts.append(prompt)
+        if prompt == "/to-prd":
+            return iter([_result_event("Published PRD #5: My PRD")])
+        if prompt == "/to-issues":
+            return iter([_result_event("Issue #6: Child one")])
+        raise AssertionError(f"unexpected grilling-style prompt {prompt!r} during confirm_advance")
+
+    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "s2")
+
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+
+    # Exactly the two chain prompts ran -- no grilling reply was ever sent.
+    assert seen_prompts == ["/to-prd", "/to-issues"]
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "details"
+    details = json.loads(row["details_json"])
+    assert details["prd"] == {"number": 5, "title": "My PRD"}
+    assert details["issues"] == [{"number": 6, "title": "Child one"}]
+    assert row["available_for_reuse"] == 1
+
+    events = live_stream._buffers.get(row_id, [])
+    assert events[-1] == {"type": "done"}
+    assert any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
+    assert any(e == {"type": "phase", "phase": "creating_issues"} for e in events)
+    assert any(e.get("type") == "turn" and e.get("phase") == "details" for e in events)
+
+
 def test_continue_session_job_advances_through_prd_and_issues_to_details(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
@@ -214,7 +337,14 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
     monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
     monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "s2")
 
+    # The grilling reply itself: no more questions -> stays in grilling and
+    # publishes the wrap-up turn, no auto-advance.
     asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "grilling"
+
+    # Explicit "Yes, proceed" is what actually advances the chain.
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
     row = db.get_session(conn, row_id)
     assert row["phase"] == "details"
@@ -252,7 +382,7 @@ def test_to_prd_auth_failure_sets_error_and_needs_github_login(client, tmp_path,
 
     monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
 
-    asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
     row = db.get_session(conn, row_id)
     assert row["phase"] == "creating_prd"
@@ -280,7 +410,7 @@ def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypa
         return iter([_result_event("done")])
 
     monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
-    asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
     def fake_stream_prompt(prompt, **kw):
         if prompt == "/to-prd":
@@ -405,7 +535,7 @@ def test_retry_on_creating_prd_phase_is_unaffected_by_implement_branch(client, t
         return iter([_result_event("done")])
 
     monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
-    asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
     def fake_stream_prompt(prompt, **kw):
         if prompt == "/to-prd":
@@ -669,7 +799,7 @@ def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch)
 
     monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
     monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "pooled-session")
-    asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd_a))
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd_a, confirm_advance=True))
 
     row = db.get_session(conn, row_id)
     assert row["available_for_reuse"] == 1

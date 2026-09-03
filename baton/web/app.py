@@ -333,7 +333,12 @@ async def continue_session(body: dict):
         return {"error": "Session not found"}
 
     cwd = _active_project_cwd()
-    asyncio.create_task(session_runner.continue_session_job(row["id"], body["reply"], cwd=cwd))
+    confirm_advance = body.get("confirm_advance", False)
+    asyncio.create_task(
+        session_runner.continue_session_job(
+            row["id"], body.get("reply", ""), cwd=cwd, confirm_advance=confirm_advance
+        )
+    )
 
     return {"card_id": row["id"]}
 

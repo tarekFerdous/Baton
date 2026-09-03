@@ -701,7 +701,12 @@
           return;
         }
         currentLeftSession = { card_id: cardId, phase: "grilling", interview: event.interview };
-        renderInterview({ preamble: event.interview.preamble, sections: event.interview.sections });
+        const sections = event.interview.sections;
+        if ((!sections || sections.length === 0) && event.interview.preamble) {
+          renderReadyToProceed(event.interview.preamble);
+        } else {
+          renderInterview({ preamble: event.interview.preamble, sections: event.interview.sections });
+        }
         return;
       }
 
@@ -782,6 +787,65 @@
       // phase) arrives asynchronously over the already-open event stream.
     }
 
+    async function sendConfirmAdvance(triggerBtn) {
+      if (leftCardId === null) return;
+      triggerBtn.disabled = true;
+      const res = await fetch("/api/session/continue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ card_id: leftCardId, confirm_advance: true }),
+      });
+      const data = await res.json();
+
+      if (data.error) {
+        triggerBtn.disabled = false;
+        showGrillingError(data.error);
+      }
+      // Otherwise, the chain's effect (creating_prd, creating_issues, details)
+      // arrives asynchronously over the already-open event stream, same as
+      // every other phase transition.
+    }
+
+    function renderReadyToProceed(preamble) {
+      interviewEl.innerHTML = "";
+
+      if (preamble) {
+        const p = document.createElement("p");
+        p.className = "preamble";
+        p.textContent = preamble;
+        interviewEl.appendChild(p);
+      }
+
+      const actions = document.createElement("div");
+      actions.className = "ready-to-proceed-actions";
+
+      const yesBtn = document.createElement("button");
+      yesBtn.type = "button";
+      yesBtn.className = "glass-btn";
+      yesBtn.textContent = "Yes, proceed";
+      yesBtn.addEventListener("click", () => sendConfirmAdvance(yesBtn));
+      actions.appendChild(yesBtn);
+
+      const noBtn = document.createElement("button");
+      noBtn.type = "button";
+      noBtn.className = "glass-btn";
+      noBtn.textContent = "No, keep discussing";
+      noBtn.addEventListener("click", () => {
+        actions.remove();
+        interviewEl.appendChild(renderManualReply(sendReply));
+      });
+      actions.appendChild(noBtn);
+
+      interviewEl.appendChild(actions);
+    }
+
+    function matchesRecommendation(optionText, recommendation) {
+      if (!recommendation) return false;
+      const opt = optionText.toLowerCase();
+      const rec = recommendation.toLowerCase();
+      return opt.includes(rec) || rec.includes(opt);
+    }
+
     function renderInterview(data) {
       interviewEl.innerHTML = "";
       const answers = {};
@@ -805,6 +869,13 @@
           const block = document.createElement("div");
           block.className = "question-block";
 
+          if (q.title) {
+            const titleLabel = document.createElement("p");
+            titleLabel.className = "question-title";
+            titleLabel.textContent = q.title;
+            block.appendChild(titleLabel);
+          }
+
           const label = document.createElement("p");
           label.className = "question-text";
           label.textContent = q.text;
@@ -813,6 +884,9 @@
           if (q.options) {
             const optWrap = document.createElement("div");
             optWrap.className = "option-list";
+            const recommendedOption = q.recommendation
+              ? q.options.find((opt) => matchesRecommendation(opt, q.recommendation))
+              : undefined;
             q.options.forEach((opt) => {
               const btn = document.createElement("button");
               btn.type = "button";
@@ -823,12 +897,22 @@
                 optWrap.querySelectorAll(".option-btn").forEach((b) => b.classList.remove("selected"));
                 btn.classList.add("selected");
               });
+              if (opt === recommendedOption) {
+                btn.classList.add("selected");
+              }
               optWrap.appendChild(btn);
             });
+            if (recommendedOption !== undefined) {
+              answers[q.id] = recommendedOption;
+            }
             block.appendChild(optWrap);
           } else {
             const input = document.createElement("textarea");
             input.className = "answer-box";
+            if (q.recommendation) {
+              input.value = q.recommendation;
+              answers[q.id] = q.recommendation;
+            }
             input.addEventListener("input", () => {
               answers[q.id] = input.value;
               autoGrow(input);

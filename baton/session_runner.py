@@ -108,9 +108,11 @@ async def _run_grilling_turn(
     `publish_when_empty` covers `start_session_job`: a brand-new session's
     very first turn must always render (even a bare preamble with no
     structured questions), matching the old behavior of always surfacing
-    `parse_grilling_response`'s result on start. `continue_session_job`
-    leaves it False -- zero sections there means grilling just finished and
-    hands off to the chain instead of rendering an intermediate turn."""
+    `parse_grilling_response`'s result on start. `continue_session_job` now
+    always passes `True` too -- zero sections there means grilling is done
+    and the turn's preamble is the assistant's wrap-up message, which the
+    frontend renders as a "ready to proceed?" gate rather than the chain
+    auto-advancing on its own."""
     publish(card_id, {"type": "phase", "phase": "grilling"})
 
     try:
@@ -203,18 +205,28 @@ async def start_session_job(card_id: int, prompt: str, *, cwd: str | None) -> No
     await _run_grilling_turn(card_id, conn, row, f"/do {prompt}", cwd=cwd, publish_when_empty=True)
 
 
-async def continue_session_job(card_id: int, reply: str, *, cwd: str | None) -> None:
-    conn = db.get_connection()
-    row = db.get_session(conn, card_id)
-    still_grilling = await _run_grilling_turn(card_id, conn, row, reply, cwd=cwd)
-    if still_grilling is not None:
+async def continue_session_job(card_id: int, reply: str, *, cwd: str | None, confirm_advance: bool = False) -> None:
+    """A grilling reply, or an explicit "yes, proceed" confirmation.
+
+    Normal replies (`confirm_advance=False`, the default) always run one
+    more grilling CLI turn and publish its `turn` event -- whether or not
+    `sections` comes back empty -- and then stop; there is no auto-advance
+    into the PRD/issues chain anymore. When grilling has no more questions,
+    the frontend shows the turn's `preamble` with "Yes, proceed" / "No, keep
+    discussing" buttons, and "Yes" is what re-invokes this function with
+    `confirm_advance=True`.
+
+    `confirm_advance=True` skips running a grilling CLI turn entirely and
+    goes straight to `advance_past_grilling`, resuming the session's existing
+    `claude_session_id` -- exactly like `retry_session_job` does for a
+    `creating_prd` row."""
+    if confirm_advance:
+        await advance_past_grilling(card_id, cwd)
         return
 
+    conn = db.get_connection()
     row = db.get_session(conn, card_id)
-    if row["error_text"]:
-        return  # grilling turn itself failed; nothing to hand off
-
-    await advance_past_grilling(card_id, cwd)
+    await _run_grilling_turn(card_id, conn, row, reply, cwd=cwd, publish_when_empty=True)
 
 
 def _read_tracker_file(cwd: str | None) -> dict | None:

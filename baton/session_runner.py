@@ -74,6 +74,13 @@ async def _run_turn(card_id: int, prompt: str, *, session_id: str | None, cwd: s
         await asyncio.to_thread(worker)
     except ClaudeCLIError as e:
         holder["error"] = e
+    except Exception as e:
+        # Anything unexpected (a malformed CLI event, a bug in translation)
+        # must still resolve into a recorded session error, not an
+        # unhandled exception on the fire-and-forget asyncio task -- that
+        # would leave the card stuck in its in-flight phase silently
+        # instead of surfacing the failure to the user.
+        holder["error"] = ClaudeCLIError(str(e))
 
     if "error" in holder:
         raise holder["error"]

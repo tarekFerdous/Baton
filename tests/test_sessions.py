@@ -519,6 +519,42 @@ def test_start_implement_job_error_leaves_session_in_implementing_with_error_tex
     assert events[-1] == {"type": "done"}
 
 
+def test_start_implement_job_wraps_unexpected_worker_exceptions_as_session_errors(client, tmp_path, monkeypatch):
+    """A non-ClaudeCLIError exception out of the streaming worker (e.g. the
+    CLI producing non-JSON output) must still resolve into a recorded
+    session error, not an unhandled exception on the fire-and-forget
+    asyncio task that would leave the card stuck in `implementing` forever."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def crashing_stream_prompt(prompt, **kw):
+        def gen():
+            raise ValueError("boom")
+            yield  # pragma: no cover
+
+        return gen()
+
+    monkeypatch.setattr(session_runner, "stream_prompt", crashing_stream_prompt)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn,
+        project_id,
+        session_type="implement",
+        phase="implementing",
+        details={"prd": {"number": 11, "title": "Errorable"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 11, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "implementing"
+    assert "boom" in row["error_text"]
+
+    events = live_stream._buffers.get(row_id, [])
+    assert events[-1] == {"type": "done"}
+
+
 def test_parallel_mode_starts_multiple_prds_immediately_without_queueing(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)

@@ -38,6 +38,9 @@ class FakePopen:
     def wait(self):
         return self._returncode
 
+    def kill(self):
+        self._returncode = -9
+
 
 def test_stream_prompt_uses_streaming_flags_and_skips_permission_checks(monkeypatch):
     captured = {}
@@ -74,4 +77,20 @@ def test_stream_prompt_raises_on_nonzero_exit(monkeypatch):
     monkeypatch.setattr(cli_client.subprocess, "Popen", lambda args, **kw: FailingFakePopen(args, **kw))
 
     with pytest.raises(cli_client.ClaudeCLIError):
+        list(cli_client.stream_prompt("hello"))
+
+
+def test_stream_prompt_raises_claude_cli_error_on_non_json_line(monkeypatch):
+    """A stray non-JSON line on stdout (e.g. from a killed/orphaned process)
+    must surface as a debuggable ClaudeCLIError, not a bare JSONDecodeError,
+    and must not hang waiting on a process that may never exit on its own."""
+
+    class GarbledFakePopen(FakePopen):
+        def __init__(self, args, **kwargs):
+            super().__init__(args, **kwargs)
+            self.stdout = io.StringIO('{"type": "system", "subtype": "init"}\n\x00\n')
+
+    monkeypatch.setattr(cli_client.subprocess, "Popen", lambda args, **kw: GarbledFakePopen(args, **kw))
+
+    with pytest.raises(cli_client.ClaudeCLIError, match="non-JSON"):
         list(cli_client.stream_prompt("hello"))

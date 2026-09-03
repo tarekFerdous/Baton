@@ -23,6 +23,25 @@ def _clean_env() -> dict:
     return env
 
 
+def _isolated_process_group() -> dict:
+    """On Windows, spawn the child in its own process group so it's immune to
+    CTRL_C_EVENT.
+
+    `claude` runs under `cmd.exe` here (shell=True). uvicorn's `--reload`
+    restarts its server process on a file change by sending it CTRL_C_EVENT,
+    which Windows broadcasts to every process sharing the console -- including
+    an in-flight `cmd.exe`/`claude` child, whose default reaction to that is
+    to print "Terminate batch job (Y/N)?" to stdout and hang waiting for an
+    answer nobody gives it. A totally unrelated dev-server reload (e.g. from
+    an unrelated file edit while a `/implement` turn is mid-flight) would
+    otherwise tear down that turn. CREATE_NEW_PROCESS_GROUP makes Windows
+    exempt the child from CTRL_C_EVENT entirely; `Popen.kill()`/`terminate()`
+    still work regardless, since those target the process by handle."""
+    if platform.system() == "Windows":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {}
+
+
 def run_prompt(
     prompt: str,
     *,
@@ -57,6 +76,7 @@ def run_prompt(
         text=True,
         encoding="utf-8",
         shell=platform.system() == "Windows",
+        **_isolated_process_group(),
     )
 
     if result.returncode != 0:
@@ -104,22 +124,46 @@ def stream_prompt(
         text=True,
         encoding="utf-8",
         shell=platform.system() == "Windows",
+        **_isolated_process_group(),
     )
 
     assert process.stdin is not None and process.stdout is not None and process.stderr is not None
     process.stdin.write(prompt)
     process.stdin.close()
 
+    # Set instead of raised immediately: raising inside the `try` below would
+    # just get clobbered by the `finally` block's own `ClaudeCLIError` once
+    # `process.kill()` makes `returncode` non-zero. Recording it and `break`ing
+    # keeps the `try` exception-free so `finally` can raise this one instead.
+    parse_error: ClaudeCLIError | None = None
+
     try:
         for line in process.stdout:
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 yield json.loads(line)
+            except json.JSONDecodeError:
+                # Not a transient parse hiccup -- something (a killed/orphaned
+                # process, a CLI update banner, etc.) put non-JSON text on
+                # stdout. Kill the process so `wait()` below returns promptly
+                # instead of blocking on a process that may never exit on its
+                # own, and surface the offending text so this is debuggable
+                # instead of a bare "char 0" JSON error.
+                parse_error = ClaudeCLIError(f"claude produced non-JSON output: {line!r}")
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                break
     finally:
         process.stdout.close()
         returncode = process.wait()
         stderr = process.stderr.read()
         process.stderr.close()
+        if parse_error is not None:
+            raise parse_error
         if returncode != 0:
             raise ClaudeCLIError(f"claude exited with {returncode}: {stderr.strip()}")
 
@@ -141,6 +185,7 @@ def get_auth_status() -> dict:
         text=True,
         encoding="utf-8",
         shell=platform.system() == "Windows",
+        **_isolated_process_group(),
     )
 
     if result.returncode != 0:

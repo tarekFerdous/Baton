@@ -302,3 +302,29 @@ def cleanup_sessions_on_shutdown(conn: sqlite3.Connection) -> None:
     keep_id = rows[0]["id"]
     conn.execute("DELETE FROM sessions WHERE id != ?", (keep_id,))
     conn.commit()
+
+
+INTERRUPTED_ERROR_TEXT = (
+    "Interrupted: Baton was restarted while this session was implementing."
+)
+
+
+def recover_interrupted_implement_sessions(conn: sqlite3.Connection) -> None:
+    """Sweep every project's `sessions` table at process startup for
+    implement sessions stuck mid-`implementing` from a prior process that
+    died without recording an error. Marks each with a clear "interrupted"
+    error message so `has_active_implement_session` /
+    `has_any_active_implement_session` (and the frontend's
+    `computeImplementingPrdNumbers`) stop treating it as still running --
+    mirrors `cleanup_sessions_on_shutdown`'s "sweep once at a process
+    boundary, across every project" shape, but marks rows instead of
+    deleting them."""
+    conn.execute(
+        """
+        UPDATE sessions
+        SET error_text = ?
+        WHERE session_type = 'implement' AND phase = 'implementing' AND error_text IS NULL
+        """,
+        (INTERRUPTED_ERROR_TEXT,),
+    )
+    conn.commit()

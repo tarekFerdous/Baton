@@ -325,9 +325,26 @@ async def retry_session_job(card_id: int, cwd: str | None) -> None:
     """Resume a session left in `creating_prd` or `creating_issues` -- either
     because that phase errored (e.g. GitHub auth) or because the app process
     restarted mid-phase. Resumes from that phase and completes the rest live,
-    matching what a fresh run through the chain would have done."""
+    matching what a fresh run through the chain would have done.
+
+    An errored `implement` session is handled differently: its own
+    `claude_session_id` may belong to a CLI turn that died mid-flight, so
+    resuming it isn't safe. Instead this reads the PRD it was implementing
+    out of `details_json` and hands off to `start_or_queue_implement`, the
+    same entry point a fresh PRD-list click uses -- a brand-new session row
+    is created (and queued instead of started immediately if serial mode is
+    on and another implement session is already live), while the original
+    errored row is left exactly as it is, kept around as history."""
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
+
+    if row["session_type"] == "implement":
+        details = json.loads(row["details_json"]) if row["details_json"] else None
+        prd = details.get("prd") if details else None
+        if prd is None:
+            return
+        await start_or_queue_implement(row["project_id"], prd["number"], prd.get("title", ""), cwd)
+        return
 
     if row["phase"] == "creating_prd":
         await advance_past_grilling(card_id, cwd)

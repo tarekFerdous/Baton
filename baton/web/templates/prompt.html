@@ -484,6 +484,15 @@
 
     async function closeActiveProject() {
       if (!activeProject) return;
+
+      if (implementingPrdNumbers.size > 0) {
+        const confirmed = window.confirm(
+          "A PRD is still implementing. Closing this project will not stop it -- " +
+            "the implementation will keep running in the background. Close anyway?"
+        );
+        if (!confirmed) return;
+      }
+
       await fetch(`/api/projects/${activeProject.id}/close`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },

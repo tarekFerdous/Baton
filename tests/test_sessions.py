@@ -291,6 +291,131 @@ def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypa
     assert details["prd"] == {"number": 9, "title": "Retried PRD"}
 
 
+def test_retry_on_errored_implement_session_creates_a_new_row_and_completes(client, tmp_path, monkeypatch):
+    """Retrying an errored implement session must not resume the original
+    row's (possibly dead) claude_session_id -- it must go through
+    start_or_queue_implement, the same entry point a fresh PRD-list click
+    uses, creating a brand-new session row that then progresses normally."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn,
+        project_id,
+        session_type="implement",
+        phase="implementing",
+        details={"prd": {"number": 12, "title": "Errored PRD"}},
+    )
+    db.update_session(conn, row_id, error_text="agent crashed mid-turn")
+
+    monkeypatch.setattr(
+        session_runner,
+        "stream_prompt",
+        lambda prompt, **kw: iter([_result_event("Implemented PRD #12", session_id="impl-retry")]),
+    )
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "pooled-retry")
+
+    response = client.post(f"/api/sessions/{row_id}/retry")
+    assert response.status_code == 200
+
+    sessions = db.list_sessions_for_project(conn, project_id)
+    implement_sessions = [s for s in sessions if s["session_type"] == "implement"]
+    assert len(implement_sessions) == 2
+
+    new_row = next(s for s in implement_sessions if s["id"] != row_id)
+    assert new_row["phase"] == "implemented"
+    assert json.loads(new_row["details_json"])["prd"] == {"number": 12, "title": "Errored PRD"}
+
+    original_row = db.get_session(conn, row_id)
+    assert original_row["phase"] == "implementing"
+    assert original_row["error_text"] == "agent crashed mid-turn"
+
+
+def test_retry_on_errored_implement_session_respects_serial_mode_queueing(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    db.set_parallel_implementation(conn, False)
+
+    # An already-live implement session for this project (serial mode: a
+    # retry while this is running must queue rather than start immediately).
+    db.create_session(
+        conn,
+        project_id,
+        session_type="implement",
+        phase="implementing",
+        details={"prd": {"number": 20, "title": "Currently Running"}},
+    )
+
+    errored_row_id = db.create_session(
+        conn,
+        project_id,
+        session_type="implement",
+        phase="implementing",
+        details={"prd": {"number": 21, "title": "Errored PRD"}},
+    )
+    db.update_session(conn, errored_row_id, error_text="agent crashed mid-turn")
+
+    async def _noop_job(card_id, prd_number, *, cwd):
+        return None
+
+    monkeypatch.setattr(session_runner, "start_implement_job", _noop_job)
+
+    asyncio.run(session_runner.retry_session_job(errored_row_id, cwd))
+
+    sessions = db.list_sessions_for_project(conn, project_id)
+    implement_sessions = [s for s in sessions if s["session_type"] == "implement"]
+    # No new row was created -- the retry was enqueued instead.
+    assert len(implement_sessions) == 2
+    assert session_runner._implement_queues.get(project_id) == [{"number": 21, "title": "Errored PRD"}]
+
+    original_row = db.get_session(conn, errored_row_id)
+    assert original_row["phase"] == "implementing"
+    assert original_row["error_text"] == "agent crashed mid-turn"
+
+
+def test_retry_on_creating_prd_phase_is_unaffected_by_implement_branch(client, tmp_path, monkeypatch):
+    """Guard against regressing the existing creating_prd/creating_issues
+    retry path when adding the implement-session branch."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    monkeypatch.setattr(
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("- Only question?")])
+    )
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    def failing_stream_prompt(prompt, **kw):
+        if prompt == "/to-prd":
+            raise ClaudeCLIError("not logged in")
+        return iter([_result_event("done")])
+
+    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
+    asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
+
+    def fake_stream_prompt(prompt, **kw):
+        if prompt == "/to-prd":
+            return iter([_result_event("PRD #30: Regression PRD")])
+        if prompt == "/to-issues":
+            return iter([_result_event("Issue #31: Only child")])
+        return iter([_result_event("done")])
+
+    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "s2")
+
+    asyncio.run(session_runner.retry_session_job(row_id, cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "details"
+    assert row["error_text"] is None
+    details = json.loads(row["details_json"])
+    assert details["prd"] == {"number": 30, "title": "Regression PRD"}
+
+
 def test_start_implement_job_reaches_implemented_and_pools_falling_back_to_seeded_details(client, tmp_path, monkeypatch):
     """No `.claude/implement-tracker.json` written -- the seeded `{"prd": ...}`
     details from creation must survive into the terminal `implemented` row."""

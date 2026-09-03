@@ -190,3 +190,61 @@ def test_cleanup_sessions_on_shutdown_keeps_only_most_recently_used(tmp_path):
 
     remaining = conn.execute("SELECT id FROM sessions").fetchall()
     assert [r["id"] for r in remaining] == [newest]
+
+
+def test_recover_interrupted_implement_sessions_marks_stuck_row(tmp_path):
+    conn = db.get_connection(tmp_path / "baton.db")
+    stuck_id = db.create_session(
+        conn, project_id=1, session_type="implement", phase="implementing", details={"prd": {"number": 1}}
+    )
+
+    db.recover_interrupted_implement_sessions(conn)
+
+    row = db.get_session(conn, stuck_id)
+    assert row["error_text"]
+    assert "interrupted" in row["error_text"].lower()
+
+
+def test_recover_interrupted_implement_sessions_leaves_existing_error_untouched(tmp_path):
+    conn = db.get_connection(tmp_path / "baton.db")
+    errored_id = db.create_session(
+        conn, project_id=1, session_type="implement", phase="implementing", details={"prd": {"number": 1}}
+    )
+    db.update_session(conn, errored_id, error_text="original failure")
+
+    db.recover_interrupted_implement_sessions(conn)
+
+    row = db.get_session(conn, errored_id)
+    assert row["error_text"] == "original failure"
+
+
+def test_recover_interrupted_implement_sessions_leaves_implemented_untouched(tmp_path):
+    conn = db.get_connection(tmp_path / "baton.db")
+    implemented_id = db.create_session(
+        conn, project_id=1, session_type="implement", phase="implemented", details={"prd": {"number": 1}}
+    )
+
+    db.recover_interrupted_implement_sessions(conn)
+
+    row = db.get_session(conn, implemented_id)
+    assert row["error_text"] is None
+
+
+def test_recover_interrupted_implement_sessions_leaves_do_session_untouched(tmp_path):
+    conn = db.get_connection(tmp_path / "baton.db")
+    do_id = db.create_session(conn, project_id=1, session_type="do", phase="implementing")
+
+    db.recover_interrupted_implement_sessions(conn)
+
+    row = db.get_session(conn, do_id)
+    assert row["error_text"] is None
+
+
+def test_recover_interrupted_implement_sessions_leaves_grilling_do_session_untouched(tmp_path):
+    conn = db.get_connection(tmp_path / "baton.db")
+    do_id = db.create_session(conn, project_id=1, session_type="do", phase="grilling")
+
+    db.recover_interrupted_implement_sessions(conn)
+
+    row = db.get_session(conn, do_id)
+    assert row["error_text"] is None

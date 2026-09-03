@@ -23,6 +23,7 @@ BASE_DIR = Path(__file__).parent
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     live_stream.set_loop(asyncio.get_running_loop())
+    db.recover_interrupted_implement_sessions(db.get_connection())
     afk_task = asyncio.create_task(
         afk_loop.run_forever(
             get_active_project_id=lambda: _active_project_id,

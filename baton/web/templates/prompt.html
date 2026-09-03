@@ -61,6 +61,10 @@
       <h2 class="modal-heading">Root Directory</h2>
       <p id="current-root-dir" class="current-root-dir">No directory set.</p>
       <button id="modal-pick-btn" class="glass-btn" type="button">Choose Folder…</button>
+
+      <label for="afk-hours-input" class="modal-field-label">Hours until self-implement (AFK)</label>
+      <input id="afk-hours-input" class="modal-number-input" type="number" min="1" step="1" />
+
       <button id="modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
     </div>
   </div>
@@ -82,6 +86,7 @@
     const activeProjectNameEl = document.getElementById("active-project-name");
     const settingsModalEl = document.getElementById("settings-modal");
     const currentRootDirEl = document.getElementById("current-root-dir");
+    const afkHoursInputEl = document.getElementById("afk-hours-input");
     const brandHeadingEl = document.getElementById("brand-heading");
     const sessionQueueEl = document.getElementById("session-queue");
     const consoleOutputEl = document.getElementById("console-output");
@@ -95,6 +100,7 @@
     const retryBtn = document.getElementById("retry-btn");
 
     let knownRootDir = null;
+    let knownAfkHours = null;
 
     function autoGrow(el) {
       el.style.height = "auto";
@@ -288,6 +294,7 @@
       const res = await fetch("/api/app-state");
       const state = await res.json();
       knownRootDir = state.root_dir;
+      knownAfkHours = state.afk_hours;
 
       if (state.active_project) {
         await activateProject(state.active_project);
@@ -305,11 +312,29 @@
 
     function openSettingsModal() {
       currentRootDirEl.textContent = knownRootDir || "No directory set.";
+      afkHoursInputEl.value = knownAfkHours ?? 6;
       settingsModalEl.hidden = false;
     }
 
     function closeSettingsModal() {
       settingsModalEl.hidden = true;
+    }
+
+    async function updateAfkHours() {
+      const hours = parseInt(afkHoursInputEl.value, 10);
+      if (!Number.isFinite(hours) || hours < 1) {
+        afkHoursInputEl.value = knownAfkHours ?? 6;
+        return;
+      }
+
+      const res = await fetch("/api/settings/afk-hours", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ afk_hours: hours }),
+      });
+      const data = await res.json();
+      knownAfkHours = data.afk_hours;
+      afkHoursInputEl.value = knownAfkHours;
     }
 
     async function pickRootDir() {
@@ -339,6 +364,7 @@
     document.getElementById("open-root-btn").addEventListener("click", openSettingsModal);
     document.getElementById("modal-close-btn").addEventListener("click", closeSettingsModal);
     document.getElementById("modal-pick-btn").addEventListener("click", pickRootDir);
+    afkHoursInputEl.addEventListener("change", updateAfkHours);
     document.getElementById("close-project-btn").addEventListener("click", closeActiveProject);
 
     let eventSource = null;

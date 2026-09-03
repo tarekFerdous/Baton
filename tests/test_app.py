@@ -8,6 +8,19 @@ def _init_repo(path, remote_url):
     subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=path, check=True)
 
 
+def test_app_state_defaults_afk_hours_to_six(client):
+    state = client.get("/api/app-state").json()
+    assert state["afk_hours"] == 6
+
+
+def test_set_afk_hours_persists_and_reflects_in_app_state(client):
+    resp = client.post("/api/settings/afk-hours", json={"afk_hours": 12})
+    assert resp.json() == {"afk_hours": 12}
+
+    state = client.get("/api/app-state").json()
+    assert state["afk_hours"] == 12
+
+
 def test_root_dir_change_without_confirmation_leaves_projects_untouched(client, tmp_path):
     root_a = tmp_path / "root_a"
     root_a.mkdir()

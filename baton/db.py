@@ -33,6 +33,12 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
         )
         """
     )
+    # CREATE TABLE IF NOT EXISTS above won't add new columns to a settings
+    # table that already exists on disk from before this column existed --
+    # add it here, no-op'ing if it's already present.
+    existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(settings)")}
+    if "afk_hours" not in existing_columns:
+        conn.execute("ALTER TABLE settings ADD COLUMN afk_hours INTEGER NOT NULL DEFAULT 6")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS projects (
@@ -79,6 +85,22 @@ def set_root_dir(conn: sqlite3.Connection, root_dir: str) -> None:
         ON CONFLICT(id) DO UPDATE SET root_dir = excluded.root_dir
         """,
         (root_dir,),
+    )
+    conn.commit()
+
+
+def get_afk_hours(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT afk_hours FROM settings WHERE id = 1").fetchone()
+    return row["afk_hours"] if row else 6
+
+
+def set_afk_hours(conn: sqlite3.Connection, hours: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO settings (id, afk_hours) VALUES (1, ?)
+        ON CONFLICT(id) DO UPDATE SET afk_hours = excluded.afk_hours
+        """,
+        (hours,),
     )
     conn.commit()
 

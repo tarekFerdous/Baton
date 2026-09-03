@@ -69,6 +69,12 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
         )
         """
     )
+    # Same guarded-migration approach as afk_hours above: a sessions table
+    # that already exists on disk from before session_type existed won't get
+    # the new column from CREATE TABLE IF NOT EXISTS.
+    session_columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "session_type" not in session_columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'do'")
     conn.commit()
     return conn
 
@@ -154,17 +160,26 @@ def load_session_state(row: sqlite3.Row) -> dict:
 
 # --- Concurrent session orchestration (PRD 2) -----------------------------
 
-PHASES = ("grilling", "creating_prd", "creating_issues", "details")
+PHASES = ("grilling", "creating_prd", "creating_issues", "details", "implementing", "implemented")
 
 
-def create_session(conn: sqlite3.Connection, project_id: int, claude_session_id: str | None = None) -> int:
+def create_session(
+    conn: sqlite3.Connection,
+    project_id: int,
+    claude_session_id: str | None = None,
+    *,
+    session_type: str = "do",
+    phase: str = "grilling",
+    details: dict | None = None,
+) -> int:
     now = datetime.now(timezone.utc).isoformat()
+    details_json = json.dumps(details) if details is not None else None
     cur = conn.execute(
         """
-        INSERT INTO sessions (project_id, claude_session_id, phase, last_activity, created_at)
-        VALUES (?, ?, 'grilling', ?, ?)
+        INSERT INTO sessions (project_id, claude_session_id, session_type, phase, details_json, last_activity, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (project_id, claude_session_id, now, now),
+        (project_id, claude_session_id, session_type, phase, details_json, now, now),
     )
     conn.commit()
     return cur.lastrowid
@@ -217,6 +232,29 @@ def claim_available_session(conn: sqlite3.Connection, project_id: int) -> sqlite
         conn.commit()
         row = get_session(conn, row["id"])
     return row
+
+
+def has_active_implement_session(conn: sqlite3.Connection, project_id: int, prd_number: int) -> bool:
+    """True if this project already has a live (non-terminal) implement
+    session for `prd_number`. There's no dedicated PRD-number column on
+    `sessions`, so this filters the (short) candidate list in Python by
+    peeking into each row's `details_json` (seeded at creation with
+    `{"prd": {"number": ...}}`)."""
+    rows = conn.execute(
+        """
+        SELECT details_json FROM sessions
+        WHERE project_id = ? AND session_type = 'implement' AND phase = 'implementing' AND error_text IS NULL
+        """,
+        (project_id,),
+    ).fetchall()
+    for row in rows:
+        if not row["details_json"]:
+            continue
+        details = json.loads(row["details_json"])
+        prd = details.get("prd") if isinstance(details, dict) else None
+        if prd and prd.get("number") == prd_number:
+            return True
+    return False
 
 
 def cleanup_sessions_on_shutdown(conn: sqlite3.Connection) -> None:

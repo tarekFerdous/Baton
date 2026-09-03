@@ -202,6 +202,8 @@
           creating_prd: "Creating PRD...",
           creating_issues: "Creating Issues...",
           details: "Details",
+          implementing: "Implementing...",
+          implemented: "Implemented",
         }[phase] || "What are we doing?"
       );
     }
@@ -213,6 +215,8 @@
           creating_prd: "Creating PRD...",
           creating_issues: "Creating Issues...",
           details: "Done",
+          implementing: "Implementing...",
+          implemented: "Implemented",
         }[phase] || phase
       );
     }
@@ -274,16 +278,81 @@
       await loadPrdList();
     }
 
+    // PRD numbers with a live (non-terminal) implement session running --
+    // their button on the "To be implemented" card is disabled while a
+    // member of this set. Recomputed from the fetched session list every
+    // time sessions are (re)loaded, not just from an optimistic click.
+    let implementingPrdNumbers = new Set();
+    let lastPrds = [];
+
+    function computeImplementingPrdNumbers(sessions) {
+      const set = new Set();
+      (sessions || []).forEach((s) => {
+        if (s.session_type === "implement" && s.phase === "implementing" && !s.error && s.details && s.details.prd) {
+          set.add(s.details.prd.number);
+        }
+      });
+      return set;
+    }
+
+    function sameNumberSet(a, b) {
+      if (a.size !== b.size) return false;
+      for (const v of a) {
+        if (!b.has(v)) return false;
+      }
+      return true;
+    }
+
+    function refreshImplementingPrdNumbers(sessions) {
+      const next = computeImplementingPrdNumbers(sessions);
+      if (!sameNumberSet(next, implementingPrdNumbers)) {
+        implementingPrdNumbers = next;
+        renderPrdList(lastPrds);
+      }
+    }
+
     async function loadSessionQueue() {
       if (!activeProject) return;
       const res = await fetch(`/api/projects/${activeProject.id}/sessions`);
       const data = await res.json();
       rightCards.clear();
-      (data.sessions || []).forEach((s) => rightCards.set(s.card_id, s));
+      (data.sessions || []).forEach((s) => {
+        rightCards.set(s.card_id, s);
+        cardSessionTypes.set(s.card_id, s.session_type);
+      });
+      refreshImplementingPrdNumbers(data.sessions || []);
+      renderQueue();
+    }
+
+    async function startImplementSession(prd, btn) {
+      if (btn) btn.disabled = true;
+      const res = await fetch("/api/session/start-implement", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ number: prd.number, title: prd.title }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        if (btn && !implementingPrdNumbers.has(prd.number)) btn.disabled = false;
+        return;
+      }
+
+      implementingPrdNumbers.add(prd.number);
+      cardSessionTypes.set(data.card_id, "implement");
+      rightCards.set(data.card_id, {
+        card_id: data.card_id,
+        session_type: "implement",
+        phase: "implementing",
+        details: { prd: { number: prd.number, title: prd.title } },
+        error: null,
+        needs_github_login: false,
+      });
+      renderPrdList(lastPrds);
       renderQueue();
     }
 
     function renderPrdList(prds) {
+      lastPrds = prds;
       prdButtonRowEl.innerHTML = "";
       prdCardEl.hidden = prds.length === 0;
       prds.forEach((prd) => {
@@ -291,6 +360,16 @@
         btn.type = "button";
         btn.className = "prd-btn";
         btn.textContent = `PRD: ${prd.number}`;
+
+        const implementing = implementingPrdNumbers.has(prd.number);
+        if (implementing) btn.classList.add("prd-btn-implementing");
+
+        if (prd.blocked || implementing) {
+          btn.disabled = true;
+        } else {
+          btn.addEventListener("click", () => startImplementSession(prd, btn));
+        }
+
         prdButtonRowEl.appendChild(btn);
       });
     }
@@ -310,8 +389,10 @@
       // a background session's badge only ever updates this way, since its
       // events aren't being tailed while a different card is focused.
       (data.sessions || []).forEach((s) => {
+        cardSessionTypes.set(s.card_id, s.session_type);
         if (s.card_id !== leftCardId) rightCards.set(s.card_id, s);
       });
+      refreshImplementingPrdNumbers(data.sessions || []);
       renderQueue();
     }
 
@@ -417,6 +498,10 @@
     let eventSource = null;
     let currentTextEl = null;
     const cardSnapshots = new Map(); // card_id -> latest {phase, interview, details, error, needs_github_login}
+    // The `turn` SSE event carries no session_type (it's static session
+    // metadata, not turn-specific) -- track it here so a card's type survives
+    // being focused/finished via applyTurn/finishCard without being dropped.
+    const cardSessionTypes = new Map();
 
     function appendConsoleLine(text, className) {
       const p = document.createElement("p");
@@ -486,6 +571,7 @@
       if (cardId === leftCardId) currentTextEl = null;
       const snapshot = {
         card_id: cardId,
+        session_type: cardSessionTypes.get(cardId) || "do",
         phase: event.phase,
         interview: event.interview,
         details: event.details,
@@ -690,7 +776,7 @@
         return;
       }
 
-      if (session.phase === "details" && session.details) {
+      if ((session.phase === "details" || session.phase === "implemented") && session.details) {
         detailsViewEl.appendChild(renderDetailsList(session.details));
       }
     }
@@ -710,6 +796,16 @@
       setHeading(headingForPhase(session.phase));
       showOnly(sessionStatusEl);
       renderSessionStatus(session);
+    }
+
+    function queueLabelForSession(session) {
+      if (session.error) return "Error";
+      if (session.session_type === "implement") {
+        const num = session.details && session.details.prd ? session.details.prd.number : "";
+        if (session.phase === "implementing") return `Implementing PRD #${num}`;
+        if (session.phase === "implemented") return `Implemented PRD #${num}`;
+      }
+      return phaseLabelText(session.phase);
     }
 
     function badgeForSession(session) {
@@ -741,7 +837,7 @@
 
         const label = document.createElement("span");
         label.className = "session-card-phase";
-        label.textContent = session.error ? "Error" : phaseLabelText(session.phase);
+        label.textContent = queueLabelForSession(session);
         card.appendChild(label);
 
         const badge = badgeForSession(session);
@@ -760,6 +856,7 @@
     function focusCard(cardId) {
       const session = rightCards.get(cardId);
       if (!session) return;
+      cardSessionTypes.set(cardId, session.session_type || "do");
       rightCards.delete(cardId);
 
       if (leftCardId !== null && currentLeftSession) {

@@ -1,5 +1,6 @@
 import subprocess
 
+from baton import db, session_runner
 from baton.web import app as app_module
 
 
@@ -120,3 +121,34 @@ def test_prds_endpoint_returns_sorted_blockage_annotated_list(client, tmp_path, 
 def test_prds_endpoint_returns_empty_for_non_active_project(client):
     resp = client.get("/api/projects/999/prds")
     assert resp.json() == {"prds": []}
+
+
+def test_start_implement_endpoint_rejects_duplicate_session_for_same_prd(client, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _init_repo(root / "repo1", "https://github.com/x/repo1.git")
+    client.post("/api/settings/root-dir", json={"root_dir": str(root)})
+    project_id = client.get("/api/app-state").json()["projects"][0]["id"]
+    client.post(f"/api/projects/{project_id}/open")
+
+    async def _noop_job(card_id, prd_number, *, cwd):
+        return None
+
+    monkeypatch.setattr(session_runner, "start_implement_job", _noop_job)
+
+    first = client.post("/api/session/start-implement", json={"number": 5, "title": "My PRD"})
+    assert "card_id" in first.json()
+
+    # A second click for the same PRD number while the first is still live
+    # must be rejected without creating a second session row.
+    second = client.post("/api/session/start-implement", json={"number": 5, "title": "My PRD"})
+    assert second.json() == {"error": "Already implementing"}
+
+    conn = db.get_connection()
+    sessions = db.list_sessions_for_project(conn, project_id)
+    implement_sessions = [s for s in sessions if s["session_type"] == "implement"]
+    assert len(implement_sessions) == 1
+
+    # A different PRD number is unaffected by the first one's in-flight session.
+    third = client.post("/api/session/start-implement", json={"number": 6, "title": "Other PRD"})
+    assert "card_id" in third.json()

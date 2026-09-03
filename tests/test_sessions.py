@@ -1,6 +1,7 @@
 import asyncio
 import json
 import subprocess
+from pathlib import Path
 
 from baton import db, live_stream, session_runner
 from baton.cli_client import ClaudeCLIError
@@ -288,6 +289,109 @@ def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypa
     assert row["error_text"] is None
     details = json.loads(row["details_json"])
     assert details["prd"] == {"number": 9, "title": "Retried PRD"}
+
+
+def test_start_implement_job_reaches_implemented_and_pools_falling_back_to_seeded_details(client, tmp_path, monkeypatch):
+    """No `.claude/implement-tracker.json` written -- the seeded `{"prd": ...}`
+    details from creation must survive into the terminal `implemented` row."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    monkeypatch.setattr(
+        session_runner,
+        "stream_prompt",
+        lambda prompt, **kw: iter([_result_event("Implemented PRD #5", session_id="impl1")]),
+    )
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "pooled-1")
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn,
+        project_id,
+        session_type="implement",
+        phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "implemented"
+    assert row["available_for_reuse"] == 1
+    assert row["claude_session_id"] == "pooled-1"
+    assert json.loads(row["details_json"]) == {"prd": {"number": 5, "title": "My PRD"}}
+
+    events = live_stream._buffers.get(row_id, [])
+    assert events[-1] == {"type": "done"}
+    assert {"type": "phase", "phase": "implementing"} in events
+    assert any(e.get("type") == "turn" and e.get("phase") == "implemented" for e in events)
+
+
+def test_start_implement_job_populates_details_from_tracker_file_when_present(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    tracker = {
+        "prd": {"number": 7, "title": "Tracked PRD"},
+        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
+        "qa_changes": [],
+        "status": "implemented",
+    }
+    claude_dir = Path(cwd) / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+
+    monkeypatch.setattr(
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("done", session_id="impl2")])
+    )
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "pooled-2")
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn,
+        project_id,
+        session_type="implement",
+        phase="implementing",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "implemented"
+    assert json.loads(row["details_json"]) == tracker
+
+    events = live_stream._buffers.get(row_id, [])
+    assert any(e.get("type") == "turn" and e.get("phase") == "implemented" and e.get("details") == tracker for e in events)
+
+
+def test_start_implement_job_error_leaves_session_in_implementing_with_error_text(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def failing_stream_prompt(prompt, **kw):
+        raise ClaudeCLIError("gh: not logged in, run `gh auth login`")
+
+    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn,
+        project_id,
+        session_type="implement",
+        phase="implementing",
+        details={"prd": {"number": 11, "title": "Errorable"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 11, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "implementing"
+    assert bool(row["needs_github_login"]) is True
+    assert "not logged in" in row["error_text"]
+
+    events = live_stream._buffers.get(row_id, [])
+    assert events[-1] == {"type": "done"}
 
 
 def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch):

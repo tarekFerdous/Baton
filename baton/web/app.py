@@ -227,6 +227,7 @@ def _session_to_dict(row) -> dict:
     return {
         "card_id": row["id"],
         "project_id": row["project_id"],
+        "session_type": row["session_type"],
         "phase": row["phase"],
         "console_text": row["console_text"],
         "interview": json.loads(row["interview_json"]) if row["interview_json"] else None,
@@ -301,6 +302,37 @@ async def continue_session(body: dict):
     asyncio.create_task(session_runner.continue_session_job(row["id"], body["reply"], cwd=cwd))
 
     return {"card_id": row["id"]}
+
+
+@app.post("/api/session/start-implement")
+async def start_implement(body: dict):
+    project_id = _active_project_id
+    cwd = _active_project_cwd()
+    if project_id is None:
+        return {"error": "No active project"}
+
+    number = body["number"]
+    title = body.get("title", "")
+
+    conn = db.get_connection()
+    if db.has_active_implement_session(conn, project_id, number):
+        return {"error": "Already implementing"}
+
+    reused = db.claim_available_session(conn, project_id)
+    resume_id = reused["claude_session_id"] if reused is not None else None
+
+    row_id = db.create_session(
+        conn,
+        project_id,
+        claude_session_id=resume_id,
+        session_type="implement",
+        phase="implementing",
+        details={"prd": {"number": number, "title": title}},
+    )
+
+    asyncio.create_task(session_runner.start_implement_job(row_id, number, cwd=cwd))
+
+    return {"card_id": row_id}
 
 
 @app.post("/api/sessions/{card_id}/retry")

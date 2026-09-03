@@ -231,6 +231,13 @@ textarea.prompt-box:focus {
   color: var(--glass-bg);
 }
 
+.prd-btn:disabled,
+.prd-btn-implementing {
+  opacity: 0.5;
+  cursor: default;
+  pointer-events: none;
+}
+
 .gear-btn {
   position: absolute;
   top: 24px;

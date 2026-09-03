@@ -11,6 +11,7 @@ unrecoverable error).
 import asyncio
 import json
 import re
+from pathlib import Path
 
 from baton import db
 from baton.cli_client import ClaudeCLIError, clear_session, stream_prompt
@@ -191,6 +192,65 @@ async def continue_session_job(card_id: int, reply: str, *, cwd: str | None) -> 
         return  # grilling turn itself failed; nothing to hand off
 
     await advance_past_grilling(card_id, cwd)
+
+
+def _read_tracker_file(cwd: str | None) -> dict | None:
+    """Read `.claude/implement-tracker.json` from the project's working
+    directory, written by the `/implement` skill's Phase 4. Returns `None`
+    if the file is missing or isn't valid JSON -- a run that errored before
+    Phase 4, or that finished but never wrote it, shouldn't crash the job."""
+    if not cwd:
+        return None
+    path = Path(cwd) / ".claude" / "implement-tracker.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None) -> None:
+    """Run a single `/implement prd: N` turn end to end: `implementing` while
+    it's in flight, then `implemented` on success with details replaced by
+    the tracker file's contents (falling back to the seeded PRD stub if the
+    tracker file is missing), then pool the session exactly like the /do
+    chain does."""
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    publish(card_id, {"type": "phase", "phase": "implementing"})
+
+    try:
+        turn = await _run_turn(
+            card_id, f"/implement prd: {prd_number}", session_id=row["claude_session_id"], cwd=cwd
+        )
+    except ClaudeCLIError as e:
+        message = str(e)
+        needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
+        db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
+        publish(card_id, _turn_event(phase="implementing", error=message, needs_github_login=bool(needs_login)))
+        publish(card_id, {"type": "done"})
+        return
+
+    console_text = row["console_text"] + "\n\n" + turn["result"] if row["console_text"] else turn["result"]
+    db.update_session(conn, card_id, console_text=console_text)
+
+    tracker = _read_tracker_file(cwd)
+    if tracker is not None:
+        details = tracker
+    else:
+        details = json.loads(row["details_json"]) if row["details_json"] else None
+
+    db.update_session(
+        conn,
+        card_id,
+        phase="implemented",
+        details_json=json.dumps(details) if details is not None else None,
+    )
+
+    new_session_id = await asyncio.to_thread(clear_session, turn["session_id"], cwd=cwd)
+    db.mark_session_available(conn, card_id, new_session_id)
+
+    publish(card_id, _turn_event(phase="implemented", details=details))
+    publish(card_id, {"type": "done"})
 
 
 async def retry_session_job(card_id: int, cwd: str | None) -> None:

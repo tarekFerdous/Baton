@@ -1,3 +1,5 @@
+import json
+
 from baton import db
 
 
@@ -81,6 +83,54 @@ def test_claim_available_session_is_scoped_to_its_project(tmp_path):
 
     # Already claimed -- not handed out twice.
     assert db.claim_available_session(conn, project_id=1) is None
+
+
+def test_create_session_seeds_session_type_phase_and_details(tmp_path):
+    conn = db.get_connection(tmp_path / "baton.db")
+    row_id = db.create_session(
+        conn,
+        project_id=1,
+        session_type="implement",
+        phase="implementing",
+        details={"prd": {"number": 3, "title": "T"}},
+    )
+
+    row = db.get_session(conn, row_id)
+    assert row["session_type"] == "implement"
+    assert row["phase"] == "implementing"
+    assert json.loads(row["details_json"]) == {"prd": {"number": 3, "title": "T"}}
+
+
+def test_create_session_defaults_session_type_to_do(tmp_path):
+    conn = db.get_connection(tmp_path / "baton.db")
+    row_id = db.create_session(conn, project_id=1)
+
+    row = db.get_session(conn, row_id)
+    assert row["session_type"] == "do"
+
+
+def test_has_active_implement_session_detects_live_session_for_prd_number(tmp_path):
+    conn = db.get_connection(tmp_path / "baton.db")
+    db.create_session(
+        conn, project_id=1, session_type="implement", phase="implementing", details={"prd": {"number": 9, "title": "X"}}
+    )
+
+    assert db.has_active_implement_session(conn, project_id=1, prd_number=9) is True
+    assert db.has_active_implement_session(conn, project_id=1, prd_number=10) is False
+    assert db.has_active_implement_session(conn, project_id=2, prd_number=9) is False
+
+
+def test_has_active_implement_session_ignores_terminal_or_errored_sessions(tmp_path):
+    conn = db.get_connection(tmp_path / "baton.db")
+    db.create_session(
+        conn, project_id=1, session_type="implement", phase="implemented", details={"prd": {"number": 4, "title": "Y"}}
+    )
+    errored_id = db.create_session(
+        conn, project_id=1, session_type="implement", phase="implementing", details={"prd": {"number": 4, "title": "Y"}}
+    )
+    db.update_session(conn, errored_id, error_text="boom")
+
+    assert db.has_active_implement_session(conn, project_id=1, prd_number=4) is False
 
 
 def test_cleanup_sessions_on_shutdown_keeps_only_most_recently_used(tmp_path):

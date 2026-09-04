@@ -13,6 +13,8 @@ import json
 import re
 from pathlib import Path
 
+_QA_GRILLING_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```")
+
 from baton import db
 from baton.cli_client import ClaudeCLIError, clear_session, stream_prompt
 from baton.live_stream import publish
@@ -250,6 +252,27 @@ async def continue_session_job(card_id: int, reply: str, *, cwd: str | None, con
     await _run_grilling_turn(card_id, conn, row, reply, cwd=cwd, model=row["model"], publish_when_empty=True)
 
 
+def _parse_qa_grilling_block(text: str) -> dict | None:
+    """Extract the first JSON code block with phase=='qa_grilling' from a
+    CLI turn result, as emitted by the /qa skill Phase 2. Returns None when
+    no such block is found (normal /implement run without the /qa auto-handoff)."""
+    for match in _QA_GRILLING_BLOCK_RE.finditer(text):
+        try:
+            data = json.loads(match.group(1))
+            if isinstance(data, dict) and data.get("phase") == "qa_grilling":
+                return data
+        except (json.JSONDecodeError, ValueError):
+            continue
+    # Fallback: bare JSON (no code fence)
+    try:
+        data = json.loads(text.strip())
+        if isinstance(data, dict) and data.get("phase") == "qa_grilling":
+            return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
 def _read_tracker_file(cwd: str | None) -> dict | None:
     """Read `.claude/implement-tracker.json` from the project's working
     directory, written by the `/implement` skill's Phase 4. Returns `None`
@@ -371,13 +394,80 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
         details_json=json.dumps(details) if details is not None else None,
     )
 
-    new_session_id = await asyncio.to_thread(clear_session, turn["session_id"], cwd=cwd, model=model)
-    db.mark_session_available(conn, card_id, new_session_id)
+    qa_data = _parse_qa_grilling_block(turn["result"])
+    if qa_data is not None:
+        # /implement Phase 5 ran /qa and emitted the checklist block.
+        # Hand the session_id to the QA session instead of pooling it here.
+        qa_row_id = db.create_session(
+            conn,
+            row["project_id"],
+            claude_session_id=turn["session_id"],
+            session_type="qa",
+            phase="qa_grilling",
+            details={"prd": qa_data.get("prd")},
+            model=model,
+        )
+        publish(card_id, {"type": "qa_started", "qa_card_id": qa_row_id})
+        publish(card_id, _turn_event(phase="implemented", details=details))
+        publish(card_id, {"type": "done"})
+        await _drain_implement_queue(row["project_id"], cwd)
+        asyncio.create_task(start_qa_job(qa_row_id, qa_data, cwd=cwd))
+    else:
+        new_session_id = await asyncio.to_thread(clear_session, turn["session_id"], cwd=cwd, model=model)
+        db.mark_session_available(conn, card_id, new_session_id)
+        publish(card_id, _turn_event(phase="implemented", details=details))
+        publish(card_id, {"type": "done"})
+        await _drain_implement_queue(row["project_id"], cwd)
 
-    publish(card_id, _turn_event(phase="implemented", details=details))
+
+async def start_qa_job(card_id: int, qa_data: dict, *, cwd: str | None) -> None:
+    """Publish the qa_grilling turn event for a QA session created by the
+    /implement auto-handoff. The JSON block was already parsed from the
+    implement turn's result; emit it and leave the session suspended (no
+    'done') until POST /api/session/qa-complete is called."""
+    publish(card_id, {"type": "phase", "phase": "qa_grilling"})
+    publish(card_id, {
+        "type": "turn",
+        "phase": "qa_grilling",
+        "prd": qa_data.get("prd"),
+        "checklist": qa_data.get("checklist", []),
+        "interview": None,
+        "details": None,
+        "error": None,
+        "needs_github_login": False,
+    })
+
+
+async def continue_qa_job(card_id: int, notes: str, *, cwd: str | None) -> None:
+    """Called from POST /api/session/qa-complete. Unblocks the QA session
+    by running Phase 3+ with the user's notes forwarded as context."""
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    model = row["model"]
+
+    db.update_session(conn, card_id, phase="qa_closing", error_text=None)
+    publish(card_id, {"type": "phase", "phase": "qa_closing"})
+
+    note_ctx = f"\nUser notes: {notes}" if notes.strip() else ""
+    prompt = (
+        f"The user reviewed the implementation and clicked Perfect.{note_ctx}\n\n"
+        "Please continue from Phase 3: close all child issues, close the parent PRD, "
+        "clear the tracker, commit, push, and run the final /clear."
+    )
+
+    try:
+        turn = await _run_turn(card_id, prompt, session_id=row["claude_session_id"], cwd=cwd, model=model)
+    except ClaudeCLIError as e:
+        message = str(e)
+        needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
+        db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
+        publish(card_id, _turn_event(phase="qa_closing", error=message, needs_github_login=bool(needs_login)))
+        publish(card_id, {"type": "done"})
+        return
+
+    db.update_session(conn, card_id, claude_session_id=turn["session_id"])
+    publish(card_id, _turn_event(phase="qa_closing"))
     publish(card_id, {"type": "done"})
-
-    await _drain_implement_queue(row["project_id"], cwd)
 
 
 async def retry_session_job(card_id: int, cwd: str | None) -> None:

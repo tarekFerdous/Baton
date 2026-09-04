@@ -956,3 +956,196 @@ def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch)
     row_id_b = db.create_session(conn, project_b, claude_session_id=resume_id_b)
     asyncio.run(session_runner.start_session_job(row_id_b, "unrelated feature", cwd=cwd_b))
     assert seen_session_ids[-1] is None
+
+
+# ---------------------------------------------------------------------------
+# QA auto-handoff tests (issue #52)
+# ---------------------------------------------------------------------------
+
+_QA_BLOCK = """\
+```json
+{
+  "phase": "qa_grilling",
+  "prd": {"number": 7, "title": "Tracked PRD"},
+  "checklist": [
+    {
+      "issue_number": 8,
+      "issue_title": "Child",
+      "items": [
+        {"id": "8-0", "text": "works"}
+      ]
+    }
+  ]
+}
+```"""
+
+
+def test_start_implement_job_triggers_qa_session_when_result_contains_qa_block(client, tmp_path, monkeypatch):
+    """When /implement Phase 5 runs /qa and the result includes the qa_grilling
+    JSON block, start_implement_job must create a new 'qa' session row, fire
+    qa_started on the implement stream, and NOT pool the implement session."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    tracker = {
+        "prd": {"number": 7, "title": "Tracked PRD"},
+        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
+        "qa_changes": [],
+        "status": "implemented",
+    }
+    from pathlib import Path
+    claude_dir = Path(cwd) / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+
+    monkeypatch.setattr(
+        session_runner, "stream_prompt",
+        lambda prompt, **kw: iter([_result_event(_QA_BLOCK, session_id="qa-session-id")])
+    )
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id,
+        session_type="implement", phase="implementing",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+
+    # Implement session ends implemented, NOT pooled
+    impl_row = db.get_session(conn, row_id)
+    assert impl_row["phase"] == "implemented"
+    assert impl_row["available_for_reuse"] == 0
+
+    # A QA session row was created
+    sessions = db.list_sessions_for_project(conn, project_id)
+    qa_sessions = [s for s in sessions if s["session_type"] == "qa"]
+    assert len(qa_sessions) == 1
+    qa_row = qa_sessions[0]
+    assert qa_row["phase"] == "qa_grilling"
+    assert qa_row["claude_session_id"] == "qa-session-id"
+    assert json.loads(qa_row["details_json"])["prd"] == {"number": 7, "title": "Tracked PRD"}
+
+    # qa_started event published on implement stream before done
+    impl_events = live_stream._buffers.get(row_id, [])
+    qa_started_events = [e for e in impl_events if e.get("type") == "qa_started"]
+    assert len(qa_started_events) == 1
+    assert qa_started_events[0]["qa_card_id"] == qa_row["id"]
+    assert impl_events[-1] == {"type": "done"}
+
+
+def test_start_implement_job_pools_session_normally_when_no_qa_block(client, tmp_path, monkeypatch):
+    """When the implement result has no qa_grilling block the session must be
+    pooled as before (no QA session created, clear_session called)."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    monkeypatch.setattr(
+        session_runner, "stream_prompt",
+        lambda prompt, **kw: iter([_result_event("Implemented PRD #5", session_id="impl1")])
+    )
+    clear_calls = []
+    monkeypatch.setattr(session_runner, "clear_session", lambda sid, cwd=None, model=None: (clear_calls.append(sid), "pooled-1")[1])
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id,
+        session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["available_for_reuse"] == 1
+    assert clear_calls == ["impl1"]
+
+    sessions = db.list_sessions_for_project(conn, project_id)
+    qa_sessions = [s for s in sessions if s["session_type"] == "qa"]
+    assert len(qa_sessions) == 0
+
+
+def test_start_qa_job_publishes_qa_grilling_turn_without_done(client, tmp_path, monkeypatch):
+    """start_qa_job emits the qa_grilling phase + turn events and does NOT fire done."""
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    qa_row_id = db.create_session(
+        conn, project_id,
+        session_type="qa", phase="qa_grilling",
+        details={"prd": {"number": 7, "title": "Test PRD"}},
+    )
+
+    qa_data = {
+        "phase": "qa_grilling",
+        "prd": {"number": 7, "title": "Test PRD"},
+        "checklist": [
+            {"issue_number": 8, "issue_title": "Child", "items": [{"id": "8-0", "text": "works"}]}
+        ],
+    }
+
+    asyncio.run(session_runner.start_qa_job(qa_row_id, qa_data, cwd=None))
+
+    events = live_stream._buffers.get(qa_row_id, [])
+    assert {"type": "phase", "phase": "qa_grilling"} in events
+    turn_events = [e for e in events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
+    assert len(turn_events) == 1
+    assert turn_events[0]["prd"] == {"number": 7, "title": "Test PRD"}
+    assert turn_events[0]["checklist"] == qa_data["checklist"]
+    # No done event — session is suspended awaiting Perfect
+    assert {"type": "done"} not in events
+
+
+def test_continue_qa_job_runs_phase3_and_fires_done(client, tmp_path, monkeypatch):
+    """continue_qa_job must run a CLI turn with the notes, then fire done."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    seen_prompts = []
+
+    def recording_stream(prompt, **kw):
+        seen_prompts.append(prompt)
+        return iter([_result_event("Closed all issues.", session_id="qa-done")])
+
+    monkeypatch.setattr(session_runner, "stream_prompt", recording_stream)
+
+    conn = db.get_connection()
+    qa_row_id = db.create_session(
+        conn, project_id,
+        session_type="qa", phase="qa_grilling",
+        claude_session_id="qa-session-1",
+        details={"prd": {"number": 7, "title": "Test PRD"}},
+    )
+
+    asyncio.run(session_runner.continue_qa_job(qa_row_id, "Looks great", cwd=cwd))
+
+    assert len(seen_prompts) == 1
+    assert "Looks great" in seen_prompts[0]
+
+    row = db.get_session(conn, qa_row_id)
+    assert row["phase"] == "qa_closing"
+    assert row["claude_session_id"] == "qa-done"
+
+    events = live_stream._buffers.get(qa_row_id, [])
+    assert {"type": "phase", "phase": "qa_closing"} in events
+    assert events[-1] == {"type": "done"}
+
+
+def test_parse_qa_grilling_block_extracts_json_from_code_fence(client, tmp_path):
+    """_parse_qa_grilling_block must find and return the qa_grilling JSON block."""
+    from baton.session_runner import _parse_qa_grilling_block
+
+    text = "Some preamble\n\n" + _QA_BLOCK + "\n\nSome trailing text"
+    result = _parse_qa_grilling_block(text)
+    assert result is not None
+    assert result["phase"] == "qa_grilling"
+    assert result["prd"]["number"] == 7
+    assert len(result["checklist"]) == 1
+
+
+def test_parse_qa_grilling_block_returns_none_for_plain_text(client, tmp_path):
+    """_parse_qa_grilling_block must return None when no qa_grilling block is present."""
+    from baton.session_runner import _parse_qa_grilling_block
+
+    assert _parse_qa_grilling_block("Implemented PRD #5") is None
+    assert _parse_qa_grilling_block("") is None
+    assert _parse_qa_grilling_block('```json\n{"phase": "other"}\n```') is None

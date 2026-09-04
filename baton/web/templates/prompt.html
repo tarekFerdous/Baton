@@ -130,11 +130,21 @@
     </div>
   </div>
 
+  <div id="qa-notification-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h2 id="qa-notification-heading" class="modal-heading"></h2>
+      <p class="modal-text">Review the checklist and click Perfect when everything looks good.</p>
+      <button id="qa-modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
+    </div>
+  </div>
+
   <script>
     let activeProject = null;
     let leftCardId = null;
     let currentLeftSession = null;
+    let preQaLeftSession = null;
     const rightCards = new Map();
+    const backgroundSources = new Map();
 
     const startForm = document.getElementById("start-form");
     const interviewEl = document.getElementById("interview");
@@ -169,6 +179,9 @@
     const afkNotificationModalEl = document.getElementById("afk-notification-modal");
     const afkNotificationLinesEl = document.getElementById("afk-notification-lines");
     const afkModalCloseBtn = document.getElementById("afk-modal-close-btn");
+    const qaNotificationModalEl = document.getElementById("qa-notification-modal");
+    const qaNotificationHeadingEl = document.getElementById("qa-notification-heading");
+    const qaModalCloseBtnEl = document.getElementById("qa-modal-close-btn");
 
     let knownRootDir = null;
     let knownAfkHours = null;
@@ -282,6 +295,8 @@
           details: "Details",
           implementing: "Implementing...",
           implemented: "Implemented",
+          qa_grilling: "Verifying implementation...",
+          qa_closing: "Closing issues...",
         }[phase] || "What are we doing?"
       );
     }
@@ -295,6 +310,8 @@
           details: "Done",
           implementing: "Implementing...",
           implemented: "Implemented",
+          qa_grilling: "Verifying implementation...",
+          qa_closing: "Closing issues...",
         }[phase] || phase
       );
     }
@@ -345,7 +362,10 @@
 
       leftCardId = null;
       currentLeftSession = null;
+      preQaLeftSession = null;
       rightCards.clear();
+      backgroundSources.forEach((es) => es.close());
+      backgroundSources.clear();
 
       resetPromptBox();
       startForm.style.display = "";
@@ -445,6 +465,12 @@
       });
       refreshImplementingPrdNumbers(data.sessions || []);
       renderQueue();
+      // Auto-subscribe to any QA session waiting for Perfect click
+      (data.sessions || []).forEach((s) => {
+        if (s.session_type === "qa" && s.phase === "qa_grilling") {
+          watchQaSession(s.card_id);
+        }
+      });
     }
 
     async function startImplementSession(prd, btn) {
@@ -527,6 +553,13 @@
       });
       refreshImplementingPrdNumbers(data.sessions || []);
       renderQueue();
+      // Auto-subscribe to any QA session newly arrived (missed qa_started event)
+      (data.sessions || []).forEach((s) => {
+        if (s.session_type === "qa" && s.phase === "qa_grilling" &&
+            !backgroundSources.has(s.card_id) && s.card_id !== leftCardId) {
+          watchQaSession(s.card_id);
+        }
+      });
       await loadAfkNotifications();
     }
 
@@ -673,6 +706,7 @@
     parallelImplementationToggleEl.addEventListener("change", updateParallelImplementation);
     document.getElementById("close-project-btn").addEventListener("click", closeActiveProject);
     afkModalCloseBtn.addEventListener("click", dismissAfkNotifications);
+    qaModalCloseBtnEl.addEventListener("click", () => { qaNotificationModalEl.hidden = true; });
     modelSelectCardEl.addEventListener("change", () => updateModel(modelSelectCardEl.value));
     modelSelectSettingsEl.addEventListener("change", () => updateModel(modelSelectSettingsEl.value));
     modelChangeModalCloseBtn.addEventListener("click", () => {
@@ -686,6 +720,108 @@
     // metadata, not turn-specific) -- track it here so a card's type survives
     // being focused/finished via applyTurn/finishCard without being dropped.
     const cardSessionTypes = new Map();
+
+    function watchQaSession(cardId) {
+      if (backgroundSources.has(cardId) || leftCardId === cardId) return;
+      if (!rightCards.has(cardId)) {
+        rightCards.set(cardId, { card_id: cardId, session_type: "qa", phase: "qa_grilling", details: null, error: null, needs_github_login: false });
+        cardSessionTypes.set(cardId, "qa");
+        renderQueue();
+      }
+      const es = new EventSource(`/api/sessions/${cardId}/stream`);
+      backgroundSources.set(cardId, es);
+      es.onmessage = (e) => handleStreamEvent(cardId, es, JSON.parse(e.data));
+      es.onerror = () => {
+        es.close();
+        backgroundSources.delete(cardId);
+      };
+    }
+
+    function renderQaGrilling(data) {
+      interviewEl.innerHTML = "";
+      startForm.style.display = "none";
+
+      (data.checklist || []).forEach((group) => {
+        const h = document.createElement("h3");
+        h.className = "section-heading";
+        h.textContent = group.issue_title;
+        interviewEl.appendChild(h);
+
+        (group.items || []).forEach((item) => {
+          const label = document.createElement("label");
+          label.className = "qa-checklist-item";
+          const cb = document.createElement("input");
+          cb.type = "checkbox";
+          cb.id = `qa-item-${item.id}`;
+          label.appendChild(cb);
+          const span = document.createElement("span");
+          span.textContent = " " + item.text;
+          label.appendChild(span);
+          interviewEl.appendChild(label);
+        });
+      });
+
+      const notesLabel = document.createElement("label");
+      notesLabel.className = "qa-notes-label";
+      notesLabel.htmlFor = "qa-notes-box";
+      notesLabel.textContent = "Notes";
+      interviewEl.appendChild(notesLabel);
+
+      const notesBox = document.createElement("textarea");
+      notesBox.className = "answer-box";
+      notesBox.id = "qa-notes-box";
+      notesBox.placeholder = "Add observations or concerns…";
+      notesBox.addEventListener("input", () => autoGrow(notesBox));
+      interviewEl.appendChild(notesBox);
+
+      const perfectBtn = document.createElement("button");
+      perfectBtn.type = "button";
+      perfectBtn.className = "glass-btn";
+      perfectBtn.textContent = "Perfect";
+      perfectBtn.style.marginTop = "12px";
+      perfectBtn.addEventListener("click", () => handlePerfectClick(notesBox, perfectBtn));
+      interviewEl.appendChild(perfectBtn);
+    }
+
+    async function handlePerfectClick(notesBox, btn) {
+      const notes = notesBox ? notesBox.value : "";
+      const qaCardId = leftCardId;
+      if (qaCardId === null) return;
+      btn.disabled = true;
+
+      const res = await fetch("/api/session/qa-complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ card_id: qaCardId, notes }),
+      });
+      const result = await res.json();
+
+      if (result.error) {
+        btn.disabled = false;
+        return;
+      }
+
+      // Move QA session to right cards so its Phase 3+ progress is visible
+      const qaSnapshot = cardSnapshots.get(qaCardId);
+      if (qaSnapshot) rightCards.set(qaCardId, qaSnapshot);
+      leftCardId = null;
+      currentLeftSession = null;
+      resetPromptBox();
+      startForm.style.display = "";
+      interviewEl.innerHTML = "";
+      setHeading("What are we doing?");
+      showOnly(mainFlowEl);
+
+      // Watch QA session progress in background (Phase 3+)
+      if (!backgroundSources.has(qaCardId)) {
+        const es = new EventSource(`/api/sessions/${qaCardId}/stream`);
+        backgroundSources.set(qaCardId, es);
+        es.onmessage = (e) => handleStreamEvent(qaCardId, es, JSON.parse(e.data));
+        es.onerror = () => { es.close(); backgroundSources.delete(qaCardId); };
+      }
+
+      renderQueue();
+    }
 
     function appendConsoleLine(text, className) {
       const p = document.createElement("p");
@@ -718,10 +854,16 @@
         return;
       }
 
+      if (event.type === "qa_started") {
+        watchQaSession(event.qa_card_id);
+        return;
+      }
+
       if (event.type === "done") {
         finishCard(cardId);
         es.close();
         if (eventSource === es) eventSource = null;
+        if (backgroundSources.get(cardId) === es) backgroundSources.delete(cardId);
         return;
       }
 
@@ -761,8 +903,56 @@
         details: event.details,
         error: event.error,
         needs_github_login: event.needs_github_login,
+        // QA-specific fields (present when phase === "qa_grilling")
+        prd: event.prd || null,
+        checklist: event.checklist || null,
       };
       cardSnapshots.set(cardId, snapshot);
+
+      if (event.phase === "qa_grilling") {
+        // Show notification modal once when QA arrives as a background session
+        if (leftCardId !== cardId && event.prd) {
+          qaNotificationHeadingEl.textContent = `PRD #${event.prd.number} was implemented`;
+          qaNotificationModalEl.hidden = false;
+        }
+
+        if (leftCardId === cardId) {
+          // QA session is already the focused card (e.g. user clicked it in queue)
+          setHeading(`QA — PRD #${event.prd?.number || ""}`);
+          renderQaGrilling(event);
+          return;
+        }
+
+        // QA session is arriving as a background card — apply minimization logic
+        const leftPrdNumber = currentLeftSession?.details?.prd?.number;
+        const qaPrdNumber = event.prd?.number;
+
+        if (leftPrdNumber && qaPrdNumber && leftPrdNumber === qaPrdNumber) {
+          // Same PRD: keep the current left session in place; QA appears in right queue
+          rightCards.set(cardId, snapshot);
+          renderQueue();
+        } else {
+          // Different PRD (or empty left card): QA takes over the left card
+          if (leftCardId !== null && currentLeftSession) {
+            preQaLeftSession = currentLeftSession;
+            rightCards.set(leftCardId, currentLeftSession);
+          }
+          // Close the current focused stream so QA takes over
+          if (eventSource) { eventSource.close(); eventSource = null; }
+          // Move background stream to primary if this was being watched in background
+          const bgEs = backgroundSources.get(cardId);
+          if (bgEs) { backgroundSources.delete(cardId); eventSource = bgEs; }
+
+          leftCardId = cardId;
+          currentLeftSession = snapshot;
+          startForm.style.display = "none";
+          setHeading(`QA — PRD #${event.prd?.number || ""}`);
+          showOnly(mainFlowEl);
+          renderQaGrilling(event);
+          renderQueue();
+        }
+        return;
+      }
 
       if (leftCardId !== cardId) return;
 
@@ -791,6 +981,10 @@
       const snapshot = cardSnapshots.get(cardId);
       if (!snapshot) return;
 
+      // Close background source if this card was being watched in the background
+      const bgEs = backgroundSources.get(cardId);
+      if (bgEs) { bgEs.close(); backgroundSources.delete(cardId); }
+
       rightCards.set(cardId, snapshot);
       if (leftCardId === cardId) {
         leftCardId = null;
@@ -801,12 +995,23 @@
         setHeading("What are we doing?");
         showOnly(mainFlowEl);
       }
+
+      // When a QA session finishes, restore the session that was displaced when QA started
+      if (snapshot.session_type === "qa" && preQaLeftSession) {
+        const restored = preQaLeftSession;
+        preQaLeftSession = null;
+        rightCards.delete(restored.card_id);
+        renderLeftSession(restored);
+        connectStream(restored.card_id);
+      }
+
       renderQueue();
 
       // A finishing `do` session means the grilling -> PRD -> issues chain
       // just completed; a finishing `implement` session means a PRD just
-      // got implemented. Either way the "To be implemented" list is stale.
-      if (snapshot.session_type === "do" || snapshot.session_type === "implement") {
+      // got implemented; a finishing `qa` session means issues were closed.
+      // All three make the "To be implemented" list stale.
+      if (snapshot.session_type === "do" || snapshot.session_type === "implement" || snapshot.session_type === "qa") {
         loadPrdList();
       }
     }
@@ -1068,6 +1273,16 @@
         return;
       }
 
+      if (session.phase === "qa_grilling") {
+        startForm.style.display = "none";
+        const snap = cardSnapshots.get(session.card_id) || session;
+        const prdNum = snap.prd?.number || snap.details?.prd?.number || "";
+        setHeading(`QA — PRD #${prdNum}`);
+        showOnly(mainFlowEl);
+        renderQaGrilling(snap);
+        return;
+      }
+
       setHeading(headingForPhase(session.phase));
       showOnly(sessionStatusEl);
       renderSessionStatus(session);
@@ -1079,6 +1294,11 @@
         const num = session.details && session.details.prd ? session.details.prd.number : "";
         if (session.phase === "implementing") return `Implementing PRD #${num}`;
         if (session.phase === "implemented") return `Implemented PRD #${num}`;
+      }
+      if (session.session_type === "qa") {
+        const snap = cardSnapshots.get(session.card_id) || session;
+        const num = snap.prd ? snap.prd.number : (snap.details && snap.details.prd ? snap.details.prd.number : "");
+        return `QA — PRD #${num}`;
       }
       return phaseLabelText(session.phase);
     }
@@ -1131,6 +1351,11 @@
     function focusCard(cardId) {
       const session = rightCards.get(cardId);
       if (!session) return;
+
+      // If this card was being watched in background, promote it to focused
+      const bgEs = backgroundSources.get(cardId);
+      if (bgEs) { bgEs.close(); backgroundSources.delete(cardId); }
+
       cardSessionTypes.set(cardId, session.session_type || "do");
       rightCards.delete(cardId);
 

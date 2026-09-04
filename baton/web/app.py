@@ -380,6 +380,18 @@ async def retry_session(card_id: int):
     return {"card_id": card_id}
 
 
+@app.post("/api/session/qa-complete")
+async def qa_complete(body: dict):
+    conn = db.get_connection()
+    row = db.get_session(conn, body["card_id"])
+    if row is None:
+        return {"error": "Session not found"}
+    cwd = _active_project_cwd()
+    notes = body.get("notes", "")
+    asyncio.create_task(session_runner.continue_qa_job(row["id"], notes, cwd=cwd))
+    return {"ok": True}
+
+
 @app.post("/api/github-login")
 def github_login():
     open_terminal_running("gh auth login")

@@ -282,3 +282,38 @@ def test_dismiss_afk_notifications_does_not_touch_session_rows(client, tmp_path,
 
     after = dict(db.get_session(conn, card_id))
     assert after == before
+
+
+def test_qa_complete_endpoint_accepts_notes_and_returns_ok(client, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _init_repo(root / "repo1", "https://github.com/x/repo1.git")
+    client.post("/api/settings/root-dir", json={"root_dir": str(root)})
+    project_id = client.get("/api/app-state").json()["projects"][0]["id"]
+    client.post(f"/api/projects/{project_id}/open")
+
+    conn = db.get_connection()
+    qa_card_id = db.create_session(
+        conn, project_id,
+        session_type="qa", phase="qa_grilling",
+        claude_session_id="qa-session-abc",
+        details={"prd": {"number": 7, "title": "Test PRD"}},
+    )
+
+    received = {}
+
+    async def _fake_continue(card_id, notes, *, cwd):
+        received["card_id"] = card_id
+        received["notes"] = notes
+
+    monkeypatch.setattr(session_runner, "continue_qa_job", _fake_continue)
+
+    resp = client.post("/api/session/qa-complete", json={"card_id": qa_card_id, "notes": "All good"})
+    assert resp.json() == {"ok": True}
+    assert received["card_id"] == qa_card_id
+    assert received["notes"] == "All good"
+
+
+def test_qa_complete_endpoint_returns_error_for_unknown_session(client):
+    resp = client.post("/api/session/qa-complete", json={"card_id": 9999, "notes": ""})
+    assert "error" in resp.json()

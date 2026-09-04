@@ -264,15 +264,27 @@ def _launch_implement(conn, project_id: int, number: int, title: str, cwd: str |
     return row_id
 
 
-async def start_or_queue_implement(project_id: int, number: int, title: str, cwd: str | None) -> dict:
+async def start_or_queue_implement(
+    project_id: int, number: int, title: str, cwd: str | None, *, allow_queue: bool = True
+) -> dict:
     """Decide whether a clicked PRD starts implementing right away or, in
     serial mode with another implement session already live for this
-    project, gets enqueued to auto-start once that slot frees up."""
+    project, gets enqueued to auto-start once that slot frees up.
+
+    `allow_queue=False` (used by `afk_loop.check_once`) skips queuing
+    entirely when another implement session is already active: the AFK
+    opportunity is dropped outright rather than deferred, so a background
+    timer decision never chains through a backlog the instant a slot frees
+    up. A manually-clicked PRD (the default, `allow_queue=True`) is
+    unaffected -- it still queues and drains as soon as the running session
+    finishes."""
     conn = db.get_connection()
     if db.has_active_implement_session(conn, project_id, number):
         return {"error": "Already implementing"}
 
     if not db.get_parallel_implementation(conn) and db.has_any_active_implement_session(conn, project_id):
+        if not allow_queue:
+            return {"skipped": True}
         _enqueue_implement(project_id, number, title)
         return {"queued": True}
 

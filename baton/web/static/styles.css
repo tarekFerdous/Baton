@@ -199,6 +199,12 @@ textarea.prompt-box:focus {
   gap: 12px;
 }
 
+.model-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .model-card-label {
   font-size: 0.85rem;
   color: var(--fg-muted);
@@ -468,6 +474,13 @@ textarea.prompt-box:focus {
   margin: 0;
   accent-color: var(--glass-bg);
   cursor: pointer;
+}
+
+.modal-warning-text {
+  color: #b45309;
+  font-size: 0.75rem;
+  text-align: left;
+  margin: -12px 0 20px;
 }
 
 .modal-select-input {

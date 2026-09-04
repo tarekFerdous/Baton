@@ -106,6 +106,7 @@ def app_state():
     afk_hours = db.get_afk_hours(conn)
     parallel_implementation = db.get_parallel_implementation(conn)
     model = db.get_model(conn)
+    effort = db.get_effort(conn)
 
     active_project = None
     if _active_project_id is not None:
@@ -123,6 +124,7 @@ def app_state():
         "afk_hours": afk_hours,
         "parallel_implementation": parallel_implementation,
         "model": model,
+        "effort": effort,
         "active_project": active_project,
         "projects": projects,
     }
@@ -177,6 +179,14 @@ def set_model(body: dict):
     model = body["model"]
     db.set_model(conn, model)
     return {"model": model}
+
+
+@app.post("/api/settings/effort")
+def set_effort(body: dict):
+    conn = db.get_connection()
+    effort = body["effort"]
+    db.set_effort(conn, effort)
+    return {"effort": effort}
 
 
 @app.post("/api/projects/{project_id}/open")
@@ -287,6 +297,17 @@ def dismiss_afk_notifications(project_id: int):
     return {"dismissed": True}
 
 
+@app.get("/api/projects/{project_id}/session-error-notifications")
+def get_session_error_notifications(project_id: int):
+    return {"notifications": session_runner.get_error_notifications(project_id)}
+
+
+@app.post("/api/projects/{project_id}/session-error-notifications/dismiss")
+def dismiss_session_error_notifications(project_id: int):
+    session_runner.dismiss_error_notifications(project_id)
+    return {"dismissed": True}
+
+
 @app.get("/api/usage")
 def get_usage():
     usage = live_stream.last_usage()
@@ -328,11 +349,32 @@ async def start_session(body: dict):
     reused = db.claim_available_session(conn, project_id)
     resume_id = reused["claude_session_id"] if reused is not None else None
 
-    row_id = db.create_session(conn, project_id, claude_session_id=resume_id)
+    # `effort` in the body is the left-card dropdown's value at the moment
+    # "Start" was clicked -- the common case for a per-session override,
+    # covered without any race. Falls back to the global default (matching
+    # `create_session`'s own fallback) when omitted.
+    effort = body.get("effort")
+    row_id = db.create_session(conn, project_id, claude_session_id=resume_id, effort=effort)
 
     asyncio.create_task(session_runner.start_session_job(row_id, body["prompt"], cwd=cwd))
 
     return {"card_id": row_id}
+
+
+@app.post("/api/sessions/{card_id}/effort")
+def set_session_effort(card_id: int, body: dict):
+    """Patch a single session's effort immediately -- used when the left-card
+    dropdown changes while that session has been started but hasn't sent its
+    first turn yet (see `session_runner.start_session_job`'s docstring for
+    why re-reading the row picks this up even given the async-task race)."""
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    if row is None:
+        return {"error": "Session not found"}
+
+    effort = body["effort"]
+    db.update_session(conn, card_id, effort=effort)
+    return {"effort": effort}
 
 
 @app.post("/api/session/continue")

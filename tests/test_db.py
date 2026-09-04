@@ -30,16 +30,44 @@ def test_afk_hours_round_trip(tmp_path):
 def test_parallel_implementation_round_trip(tmp_path):
     db_path = tmp_path / "baton.db"
     conn = db.get_connection(db_path)
-    assert db.get_parallel_implementation(conn) is True
-
-    db.set_parallel_implementation(conn, False)
     assert db.get_parallel_implementation(conn) is False
 
+    db.set_parallel_implementation(conn, True)
+    assert db.get_parallel_implementation(conn) is True
+
     reopened = db.get_connection(db_path)
+    assert db.get_parallel_implementation(reopened) is True
+
+    db.set_parallel_implementation(reopened, False)
     assert db.get_parallel_implementation(reopened) is False
 
-    db.set_parallel_implementation(reopened, True)
-    assert db.get_parallel_implementation(reopened) is True
+
+def test_parallel_implementation_column_migrates_existing_db_defaulting_off(tmp_path):
+    """A DB created before `settings.parallel_implementation` existed (simulated
+    here by building the pre-migration schema by hand) must gain the column
+    defaulting to off (sequential), not the old on-by-default behavior, and
+    keep its other settings intact when `get_connection` runs its guarded
+    ALTER TABLE."""
+    db_path = tmp_path / "baton.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            root_dir TEXT,
+            afk_hours INTEGER NOT NULL DEFAULT 6
+        )
+        """
+    )
+    conn.execute("INSERT INTO settings (id, root_dir, afk_hours) VALUES (1, '/some/root', 9)")
+    conn.commit()
+    conn.close()
+
+    migrated = db.get_connection(db_path)
+    assert db.get_parallel_implementation(migrated) is False
+    # Pre-existing data survived the migration untouched.
+    assert db.get_root_dir(migrated) == "/some/root"
+    assert db.get_afk_hours(migrated) == 9
 
 
 def test_model_round_trip(tmp_path):
@@ -80,6 +108,61 @@ def test_model_column_migrates_existing_db_without_data_loss(tmp_path):
     # Pre-existing data survived the migration untouched.
     assert db.get_root_dir(migrated) == "/some/root"
     assert db.get_afk_hours(migrated) == 9
+
+
+def test_effort_round_trip(tmp_path):
+    db_path = tmp_path / "baton.db"
+    conn = db.get_connection(db_path)
+    assert db.get_effort(conn) == "auto"
+
+    db.set_effort(conn, "high")
+    assert db.get_effort(conn) == "high"
+
+    reopened = db.get_connection(db_path)
+    assert db.get_effort(reopened) == "high"
+
+
+def test_effort_column_migrates_existing_db_without_data_loss(tmp_path):
+    """A DB created before `settings.effort` existed (simulated here by
+    building the pre-migration schema by hand) must gain the column,
+    default to "auto", and keep its other settings intact when
+    `get_connection` runs its guarded ALTER TABLE."""
+    db_path = tmp_path / "baton.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            root_dir TEXT,
+            afk_hours INTEGER NOT NULL DEFAULT 6,
+            parallel_implementation INTEGER NOT NULL DEFAULT 0,
+            model TEXT NOT NULL DEFAULT 'claude-sonnet-4-6'
+        )
+        """
+    )
+    conn.execute("INSERT INTO settings (id, root_dir, afk_hours) VALUES (1, '/some/root', 9)")
+    conn.commit()
+    conn.close()
+
+    migrated = db.get_connection(db_path)
+    assert db.get_effort(migrated) == "auto"
+    # Pre-existing data survived the migration untouched.
+    assert db.get_root_dir(migrated) == "/some/root"
+    assert db.get_afk_hours(migrated) == 9
+
+
+def test_create_session_seeds_effort_column(tmp_path):
+    conn = db.get_connection(tmp_path / "baton.db")
+    db.upsert_project(conn, "/repos/foo", "foo", "main")
+    [project] = db.list_projects(conn)
+
+    row_id = db.create_session(conn, project["id"], effort="high")
+    row = db.get_session(conn, row_id)
+    assert row["effort"] == "high"
+
+    default_row_id = db.create_session(conn, project["id"])
+    default_row = db.get_session(conn, default_row_id)
+    assert default_row["effort"] == "auto"
 
 
 def test_project_open_close_reopen_preserves_state(tmp_path):

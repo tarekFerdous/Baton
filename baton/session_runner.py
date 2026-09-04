@@ -16,7 +16,7 @@ from pathlib import Path
 _QA_GRILLING_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```")
 
 from baton import db
-from baton.cli_client import ClaudeCLIError, clear_session, stream_prompt
+from baton.cli_client import ClaudeCLIError, clear_session, close_persistent_session, stream_prompt
 from baton.github_publisher import GithubPublishError, publish_draft
 from baton.live_stream import publish
 from baton.qa_parser import parse_grilling_response
@@ -25,10 +25,115 @@ from baton.stream_translate import translate_event
 _AUTH_FAILURE_RE = re.compile(r"auth|login|not logged in|permission denied|401|403", re.IGNORECASE)
 _DETAIL_RE = re.compile(r"\b(PRD|Issue)\s*#(\d+)\s*[:\-]\s*(.+)", re.IGNORECASE)
 
+# Context-window budget: before starting the next phase in a session chain,
+# `_maybe_clear_for_next_phase` checks the row's last-recorded `context_pct`
+# against the relevant cutoff below and `/clear`s first if it's over. Both
+# are pre-phase gates only -- a phase already running is never interrupted
+# even if it crosses its cutoff while in flight. Placeholders pending real
+# /baton:implement and /baton:qa context-growth telemetry (this repo's own
+# measurements only ever covered the /do chain) -- expect these to move.
+_DO_TO_IMPLEMENT_CONTEXT_CUTOFF = 0.40
+_IMPLEMENT_TO_QA_CONTEXT_CUTOFF = 0.68
+
+# A session that just finished /baton:qa (closed its issues/PRD) is only
+# fully closed if its context usage is over this -- under it, it's marked
+# available for reuse instead (`db.claim_available_session` picks it up for
+# the next fresh /do session on the left card, warm cache and all) rather
+# than being discarded with useful headroom still left.
+_QA_DONE_RECYCLE_CONTEXT_CUTOFF = 0.50
+
+
+def _context_window_pct(raw_result_event: dict) -> float | None:
+    """Compute how full the context window was for one CLI turn, from the
+    raw (untranslated) `result` event's usage fields -- the same formula
+    Claude Code's own interactive statusline uses for its pre-calculated
+    `context_window.used_percentage` field (not itself available in headless
+    `-p` mode, hence computing it here): `(input_tokens +
+    cache_creation_input_tokens + cache_read_input_tokens) / contextWindow`.
+
+    Returns `None` when the event doesn't carry enough to compute this (no
+    `usage`/`modelUsage` block, or a zero/missing `contextWindow`) rather
+    than raising -- a session with an unknown context usage is treated as
+    safe-to-continue by every caller (see `_maybe_clear_for_next_phase`),
+    since erring toward "don't gate" only risks the growth this budget is
+    meant to catch, not silent data loss.
+    """
+    usage = raw_result_event.get("usage") or {}
+    model_usage = raw_result_event.get("modelUsage") or {}
+    first_model_usage = next(iter(model_usage.values()), {})
+    context_window = first_model_usage.get("contextWindow")
+    if not context_window:
+        return None
+
+    used = (
+        usage.get("input_tokens", 0)
+        + usage.get("cache_creation_input_tokens", 0)
+        + usage.get("cache_read_input_tokens", 0)
+    )
+    return used / context_window
+
+
+async def _maybe_clear_for_next_phase(card_id: int, conn, row, *, cwd: str | None, cutoff: float) -> str:
+    """The context-window budget gate: called right before starting the next
+    phase in a session chain (currently `/baton:do` -> `/baton:implement` at
+    `_DO_TO_IMPLEMENT_CONTEXT_CUTOFF`, `/baton:implement` -> `/baton:qa` at
+    `_IMPLEMENT_TO_QA_CONTEXT_CUTOFF` -- wired in by whichever caller is
+    orchestrating that transition).
+
+    Reads `row["context_pct"]` (persisted after the previous phase's last
+    turn) rather than measuring anything fresh: an unknown value (`None`,
+    e.g. no turn has completed yet, or the CLI's usage fields were
+    unavailable for some reason) is treated as safe to continue, same as
+    `_context_window_pct`'s own None-on-uncertainty behavior.
+
+    At or under `cutoff`: returns the row's existing `claude_session_id`
+    unchanged -- the next phase continues in the same session, no `/clear`.
+
+    Over `cutoff`: runs `/clear` (via `cli_client.clear_session`, same as
+    the end-of-chain pooling path), persists the new session id and resets
+    `context_pct` to `None` on the row (the cleared session starts with an
+    empty, unmeasured context again), and returns the new session id. This
+    is a pre-phase gate only -- once the next phase is running, it is never
+    interrupted mid-run even if it goes on to cross `cutoff` itself.
+    """
+    context_pct = row["context_pct"]
+    if context_pct is None or context_pct <= cutoff:
+        return row["claude_session_id"]
+
+    new_session_id = await asyncio.to_thread(
+        clear_session, row["claude_session_id"], cwd=cwd, model=row["model"], effort=row["effort"]
+    )
+    db.update_session(conn, card_id, claude_session_id=new_session_id, context_pct=None)
+    return new_session_id
+
 # In-memory, per-project FIFO queue for serial-mode ("parallel_implementation"
 # off) PRD implementation requests. Process-lifetime only, same as
 # `_active_project_id` in app.py -- nothing here needs to survive a restart.
 _implement_queues: dict[int, list[dict]] = {}
+
+# project_id -> list of undismissed background-session-error notifications,
+# each {"card_id": int, "phase": str, "message": str} -- an /implement or
+# /qa failure while minimized to the background (see `_auto_continue_implement_and_qa`)
+# surfaces here instead of only the (possibly unfocused) card's own inline
+# error state. Same in-memory, per-project, undismissed-until-dismissed shape
+# as `afk_loop`'s self-implement notifications, kept here instead of there to
+# avoid an afk_loop <-> session_runner import cycle (afk_loop already imports
+# this module).
+_error_notifications: dict[int, list[dict]] = {}
+
+
+def add_error_notification(project_id: int, card_id: int, phase: str, message: str) -> None:
+    _error_notifications.setdefault(project_id, []).append(
+        {"card_id": card_id, "phase": phase, "message": message}
+    )
+
+
+def get_error_notifications(project_id: int) -> list[dict]:
+    return _error_notifications.get(project_id, [])
+
+
+def dismiss_error_notifications(project_id: int) -> None:
+    _error_notifications.pop(project_id, None)
 
 
 def _enqueue_implement(project_id: int, number: int, title: str) -> None:
@@ -55,22 +160,40 @@ def parse_details(text: str) -> dict:
 
 
 async def _run_turn(
-    card_id: int, prompt: str, *, session_id: str | None, cwd: str | None, model: str | None = None
+    card_id: int,
+    prompt: str,
+    *,
+    session_id: str | None,
+    cwd: str | None,
+    model: str | None = None,
+    effort: str | None = None,
+    persistent: bool = False,
 ) -> dict:
     """Run one CLI turn in a background thread, streaming translated events
     into the session's live buffer as they arrive. Returns the raw `result`
     event's translated boundary marker ({"result", "session_id", "is_error"})
     once the turn finishes; raises ClaudeCLIError on failure -- the caller
     decides what that means for the session (grilling vs. chain phase).
+
+    `persistent=True` (the /do chain -- grilling, /to-prd, /to-issues) routes
+    the turn through `stream_prompt`'s `card_id` path, which reuses one
+    long-lived `claude` process across every turn sharing this `card_id`
+    instead of spawning a fresh one per turn -- see `cli_client.stream_prompt`.
+    `persistent=False` (the default; /implement and /qa) keeps the original
+    one-shot-per-call behavior, unchanged.
     """
     holder: dict = {}
 
     def worker():
-        for raw_event in stream_prompt(prompt, session_id=session_id, cwd=cwd, model=model):
+        kwargs = dict(session_id=session_id, cwd=cwd, model=model, effort=effort)
+        if persistent:
+            kwargs["card_id"] = card_id
+        for raw_event in stream_prompt(prompt, **kwargs):
             translated = translate_event(raw_event)
             if translated is None:
                 continue
             if translated["type"] == "turn":
+                translated["context_pct"] = _context_window_pct(raw_event)
                 holder["turn"] = translated
                 continue
             publish(card_id, translated)
@@ -104,7 +227,15 @@ def _turn_event(*, phase: str, interview=None, details=None, error=None, needs_g
 
 
 async def _run_grilling_turn(
-    card_id: int, conn, row, prompt: str, *, cwd: str | None, model: str | None, publish_when_empty: bool = False
+    card_id: int,
+    conn,
+    row,
+    prompt: str,
+    *,
+    cwd: str | None,
+    model: str | None,
+    effort: str | None,
+    publish_when_empty: bool = False,
 ) -> dict | None:
     """Run one grilling-phase turn and publish its `turn` event. Returns the
     parsed interview dict if grilling is still ongoing, `None` if this turn
@@ -127,11 +258,21 @@ async def _run_grilling_turn(
     publish(card_id, {"type": "phase", "phase": "grilling"})
 
     try:
-        turn = await _run_turn(card_id, prompt, session_id=row["claude_session_id"], cwd=cwd, model=model)
+        turn = await _run_turn(
+            card_id,
+            prompt,
+            session_id=row["claude_session_id"],
+            cwd=cwd,
+            model=model,
+            effort=effort,
+            persistent=True,
+        )
     except ClaudeCLIError as e:
         message = str(e)
         needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
-        db.update_session(conn, card_id, model=model, error_text=message, needs_github_login=needs_login)
+        db.update_session(
+            conn, card_id, model=model, effort=effort, error_text=message, needs_github_login=needs_login
+        )
         publish(card_id, _turn_event(phase="grilling", error=message, needs_github_login=bool(needs_login)))
         return None
 
@@ -141,9 +282,11 @@ async def _run_grilling_turn(
         conn,
         card_id,
         model=model,
+        effort=effort,
         claude_session_id=turn["session_id"],
         console_text=console_text,
         interview_json=json.dumps(parsed),
+        context_pct=turn.get("context_pct"),
     )
 
     if parsed["sections"] or publish_when_empty:
@@ -153,7 +296,7 @@ async def _run_grilling_turn(
 
 
 async def _run_chain_step(
-    card_id: int, conn, row, *, phase: str, prompt: str, cwd: str | None, model: str | None
+    card_id: int, conn, row, *, phase: str, prompt: str, cwd: str | None, model: str | None, effort: str | None
 ) -> tuple[bool, str | None]:
     """Run one /to-prd or /to-issues step, live-streamed. Returns (ok, claude_session_id).
 
@@ -164,7 +307,15 @@ async def _run_chain_step(
     publish(card_id, {"type": "phase", "phase": phase})
 
     try:
-        turn = await _run_turn(card_id, prompt, session_id=row["claude_session_id"], cwd=cwd, model=model)
+        turn = await _run_turn(
+            card_id,
+            prompt,
+            session_id=row["claude_session_id"],
+            cwd=cwd,
+            model=model,
+            effort=effort,
+            persistent=True,
+        )
     except ClaudeCLIError as e:
         message = str(e)
         needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
@@ -178,6 +329,7 @@ async def _run_chain_step(
         row["id"],
         claude_session_id=turn["session_id"],
         console_text=row["console_text"] + "\n\n" + turn["result"],
+        context_pct=turn.get("context_pct"),
     )
     return True, turn["session_id"]
 
@@ -214,15 +366,69 @@ async def _run_publish_step(card_id: int, conn, row, *, cwd: str | None) -> bool
 
 
 async def _finish_chain(card_id: int, conn, claude_session_id: str, cwd: str | None) -> None:
+    """`/baton:do` just reached `details` (PRD + issues published). Publishes
+    the `details` turn event, then hands off to `_auto_continue_implement_and_qa`
+    instead of the old immediate `/clear`-and-pool -- that function decides
+    whether to continue in this same session or `/clear` first (the
+    context-window budget gate), and starts `/baton:implement` automatically."""
     row = db.get_session(conn, card_id)
     details = parse_details(row["console_text"])
-    db.update_session(conn, card_id, phase="details", details_json=json.dumps(details))
-
-    new_session_id = await asyncio.to_thread(clear_session, claude_session_id, cwd=cwd, model=row["model"])
-    db.mark_session_available(conn, card_id, new_session_id)
+    db.update_session(
+        conn, card_id, phase="details", details_json=json.dumps(details), claude_session_id=claude_session_id
+    )
 
     publish(card_id, _turn_event(phase="details", details=details))
-    publish(card_id, {"type": "done"})
+
+    await _auto_continue_implement_and_qa(card_id, conn, cwd)
+
+
+async def _auto_continue_implement_and_qa(card_id: int, conn, cwd: str | None) -> None:
+    """Continue a session past `details` straight into `/baton:implement`
+    (and, if that phase's own Phase 5 hands off to `/qa`, into that too --
+    already-automatic today via `_parse_qa_grilling_block`/`start_qa_job`,
+    unchanged here) instead of pooling the session for a later manual PRD
+    click.
+
+    Publishes `minimize` before doing anything else so the frontend frees
+    the left card for a new `/do` immediately -- this session's `phase`/
+    `turn`/`done` events keep flowing exactly as they do for a manually
+    started `/implement`, so the existing right-side panel plumbing renders
+    it with no special case beyond handling `minimize` itself.
+
+    Closes this card's persistent process first regardless of what happens
+    next: `/baton:do`'s chain runs through the `card_id`-keyed persistent
+    process (see `cli_client.stream_prompt`), but `/baton:implement` always
+    runs one-shot -- the underlying `claude_session_id` conversation
+    continues either way via `--resume`, only the *local* process handle
+    needs reaping here, whether or not the context-window gate below goes
+    on to `/clear` it too.
+
+    Falls back to the old pool-and-wait behavior if `parse_details` in
+    `_finish_chain` came up with no PRD number to implement, rather than
+    getting the session stuck mid-transition."""
+    row = db.get_session(conn, card_id)
+    details = json.loads(row["details_json"]) if row["details_json"] else None
+    prd = details.get("prd") if details else None
+
+    close_persistent_session(card_id)
+
+    if prd is None:
+        new_session_id = await asyncio.to_thread(
+            clear_session, row["claude_session_id"], cwd=cwd, model=row["model"], effort=row["effort"]
+        )
+        db.mark_session_available(conn, card_id, new_session_id)
+        publish(card_id, {"type": "done"})
+        return
+
+    publish(card_id, {"type": "minimize"})
+
+    session_id = await _maybe_clear_for_next_phase(
+        card_id, conn, row, cwd=cwd, cutoff=_DO_TO_IMPLEMENT_CONTEXT_CUTOFF
+    )
+    db.update_session(
+        conn, card_id, phase="implementing", session_type="implement", claude_session_id=session_id
+    )
+    await start_implement_job(card_id, prd["number"], cwd=cwd)
 
 
 async def advance_past_grilling(card_id: int, cwd: str | None) -> None:
@@ -234,13 +440,16 @@ async def advance_past_grilling(card_id: int, cwd: str | None) -> None:
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
     model = row["model"]
-    ok, _ = await _run_chain_step(card_id, conn, row, phase="creating_prd", prompt="/to-prd", cwd=cwd, model=model)
+    effort = row["effort"]
+    ok, _ = await _run_chain_step(
+        card_id, conn, row, phase="creating_prd", prompt="/baton:to-prd", cwd=cwd, model=model, effort=effort
+    )
     if not ok:
         return
 
     row = db.get_session(conn, card_id)
     ok, claude_session_id = await _run_chain_step(
-        card_id, conn, row, phase="creating_issues", prompt="/to-issues", cwd=cwd, model=model
+        card_id, conn, row, phase="creating_issues", prompt="/baton:to-issues", cwd=cwd, model=model, effort=effort
     )
     if not ok:
         return
@@ -257,11 +466,21 @@ async def start_session_job(card_id: int, prompt: str, *, cwd: str | None) -> No
     """A brand-new grilling session begins here -- read the currently
     configured model once, now, and use it for this session's entire
     lifetime (later turns read it back off the row instead of re-checking
-    the setting)."""
+    the setting).
+
+    Effort is read off the row instead (not a fresh global lookup like
+    model): `create_session` already seeded it from the request body or the
+    global default, and re-fetching the row here (rather than trusting a
+    value captured before this task was scheduled) picks up a same-session
+    override made via `POST /api/session/{card_id}/effort` in the brief
+    window between the row's creation and this task actually running --
+    exactly the "still no turns sent yet" case that should apply immediately."""
     conn = db.get_connection()
     model = db.get_model(conn)
     row = db.get_session(conn, card_id)
-    await _run_grilling_turn(card_id, conn, row, f"/do {prompt}", cwd=cwd, model=model, publish_when_empty=True)
+    await _run_grilling_turn(
+        card_id, conn, row, f"/baton:do {prompt}", cwd=cwd, model=model, effort=row["effort"], publish_when_empty=True
+    )
 
 
 async def continue_session_job(card_id: int, reply: str, *, cwd: str | None, confirm_advance: bool = False) -> None:
@@ -286,7 +505,9 @@ async def continue_session_job(card_id: int, reply: str, *, cwd: str | None, con
 
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
-    await _run_grilling_turn(card_id, conn, row, reply, cwd=cwd, model=row["model"], publish_when_empty=True)
+    await _run_grilling_turn(
+        card_id, conn, row, reply, cwd=cwd, model=row["model"], effort=row["effort"], publish_when_empty=True
+    )
 
 
 def _parse_qa_grilling_block(text: str) -> dict | None:
@@ -335,6 +556,7 @@ def _launch_implement(conn, project_id: int, number: int, title: str, cwd: str |
     reused = db.claim_available_session(conn, project_id)
     resume_id = reused["claude_session_id"] if reused is not None else None
     model = db.get_model(conn)
+    effort = db.get_effort(conn)
 
     row_id = db.create_session(
         conn,
@@ -344,6 +566,7 @@ def _launch_implement(conn, project_id: int, number: int, title: str, cwd: str |
         phase="implementing",
         details={"prd": {"number": number, "title": title}},
         model=model,
+        effort=effort,
     )
 
     asyncio.create_task(start_implement_job(row_id, number, cwd=cwd))
@@ -400,11 +623,17 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
     model = row["model"]
+    effort = row["effort"]
     publish(card_id, {"type": "phase", "phase": "implementing"})
 
     try:
         turn = await _run_turn(
-            card_id, f"/implement prd: {prd_number}", session_id=row["claude_session_id"], cwd=cwd, model=model
+            card_id,
+            f"/baton:implement prd: {prd_number}",
+            session_id=row["claude_session_id"],
+            cwd=cwd,
+            model=model,
+            effort=effort,
         )
     except ClaudeCLIError as e:
         message = str(e)
@@ -412,11 +641,12 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
         db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
         publish(card_id, _turn_event(phase="implementing", error=message, needs_github_login=bool(needs_login)))
         publish(card_id, {"type": "done"})
+        add_error_notification(row["project_id"], card_id, "implementing", message)
         await _drain_implement_queue(row["project_id"], cwd)
         return
 
     console_text = row["console_text"] + "\n\n" + turn["result"] if row["console_text"] else turn["result"]
-    db.update_session(conn, card_id, console_text=console_text)
+    db.update_session(conn, card_id, console_text=console_text, context_pct=turn.get("context_pct"))
 
     tracker = _read_tracker_file(cwd)
     if tracker is not None:
@@ -443,6 +673,7 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
             phase="qa_grilling",
             details={"prd": qa_data.get("prd")},
             model=model,
+            effort=effort,
         )
         publish(card_id, {"type": "qa_started", "qa_card_id": qa_row_id})
         publish(card_id, _turn_event(phase="implemented", details=details))
@@ -450,7 +681,9 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
         await _drain_implement_queue(row["project_id"], cwd)
         asyncio.create_task(start_qa_job(qa_row_id, qa_data, cwd=cwd))
     else:
-        new_session_id = await asyncio.to_thread(clear_session, turn["session_id"], cwd=cwd, model=model)
+        new_session_id = await asyncio.to_thread(
+            clear_session, turn["session_id"], cwd=cwd, model=model, effort=effort
+        )
         db.mark_session_available(conn, card_id, new_session_id)
         publish(card_id, _turn_event(phase="implemented", details=details))
         publish(card_id, {"type": "done"})
@@ -481,6 +714,7 @@ async def continue_qa_job(card_id: int, notes: str, *, cwd: str | None) -> None:
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
     model = row["model"]
+    effort = row["effort"]
 
     db.update_session(conn, card_id, phase="qa_closing", error_text=None)
     publish(card_id, {"type": "phase", "phase": "qa_closing"})
@@ -493,16 +727,28 @@ async def continue_qa_job(card_id: int, notes: str, *, cwd: str | None) -> None:
     )
 
     try:
-        turn = await _run_turn(card_id, prompt, session_id=row["claude_session_id"], cwd=cwd, model=model)
+        turn = await _run_turn(
+            card_id, prompt, session_id=row["claude_session_id"], cwd=cwd, model=model, effort=effort
+        )
     except ClaudeCLIError as e:
         message = str(e)
         needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
         db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
         publish(card_id, _turn_event(phase="qa_closing", error=message, needs_github_login=bool(needs_login)))
         publish(card_id, {"type": "done"})
+        add_error_notification(row["project_id"], card_id, "qa_closing", message)
         return
 
-    db.update_session(conn, card_id, claude_session_id=turn["session_id"])
+    context_pct = turn.get("context_pct")
+    db.update_session(conn, card_id, claude_session_id=turn["session_id"], context_pct=context_pct)
+
+    # Recycle a low-usage finished session instead of leaving it dead weight:
+    # an unknown context_pct is treated as "has headroom" (same
+    # safe-by-default stance as `_context_window_pct`/`_maybe_clear_for_next_phase`),
+    # so it's marked available too.
+    if context_pct is None or context_pct < _QA_DONE_RECYCLE_CONTEXT_CUTOFF:
+        db.mark_session_available(conn, card_id, turn["session_id"])
+
     publish(card_id, _turn_event(phase="qa_closing"))
     publish(card_id, {"type": "done"})
 
@@ -536,7 +782,14 @@ async def retry_session_job(card_id: int, cwd: str | None) -> None:
         await advance_past_grilling(card_id, cwd)
     elif row["phase"] == "creating_issues":
         ok, claude_session_id = await _run_chain_step(
-            card_id, conn, row, phase="creating_issues", prompt="/to-issues", cwd=cwd, model=row["model"]
+            card_id,
+            conn,
+            row,
+            phase="creating_issues",
+            prompt="/baton:to-issues",
+            cwd=cwd,
+            model=row["model"],
+            effort=row["effort"],
         )
         if ok:
             row = db.get_session(conn, card_id)

@@ -18,6 +18,13 @@ DEFAULT_DB_PATH = Path.home() / ".baton" / "baton.db"
 # session was created with) below.
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
+# The reasoning-effort level Baton passes to every `claude` CLI invocation
+# (via `--effort`, omitted entirely for "auto") unless a session already has
+# one recorded -- see `get_effort`/`set_effort` (the global setting) and the
+# `sessions.effort` column (the value a given session was created with, or
+# updated to if changed before its first turn) below.
+DEFAULT_EFFORT = "auto"
+
 
 def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     path = db_path or DEFAULT_DB_PATH
@@ -47,11 +54,15 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
         conn.execute("ALTER TABLE settings ADD COLUMN afk_hours INTEGER NOT NULL DEFAULT 6")
     if "parallel_implementation" not in existing_columns:
         conn.execute(
-            "ALTER TABLE settings ADD COLUMN parallel_implementation INTEGER NOT NULL DEFAULT 1"
+            "ALTER TABLE settings ADD COLUMN parallel_implementation INTEGER NOT NULL DEFAULT 0"
         )
     if "model" not in existing_columns:
         conn.execute(
             f"ALTER TABLE settings ADD COLUMN model TEXT NOT NULL DEFAULT '{DEFAULT_MODEL}'"
+        )
+    if "effort" not in existing_columns:
+        conn.execute(
+            f"ALTER TABLE settings ADD COLUMN effort TEXT NOT NULL DEFAULT '{DEFAULT_EFFORT}'"
         )
     conn.execute(
         """
@@ -93,6 +104,12 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
         conn.execute(
             f"ALTER TABLE sessions ADD COLUMN model TEXT NOT NULL DEFAULT '{DEFAULT_MODEL}'"
         )
+    if "effort" not in session_columns:
+        conn.execute(
+            f"ALTER TABLE sessions ADD COLUMN effort TEXT NOT NULL DEFAULT '{DEFAULT_EFFORT}'"
+        )
+    if "context_pct" not in session_columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN context_pct REAL")
     conn.commit()
     return conn
 
@@ -131,7 +148,7 @@ def set_afk_hours(conn: sqlite3.Connection, hours: int) -> None:
 
 def get_parallel_implementation(conn: sqlite3.Connection) -> bool:
     row = conn.execute("SELECT parallel_implementation FROM settings WHERE id = 1").fetchone()
-    return bool(row["parallel_implementation"]) if row else True
+    return bool(row["parallel_implementation"]) if row else False
 
 
 def set_parallel_implementation(conn: sqlite3.Connection, value: bool) -> None:
@@ -157,6 +174,22 @@ def set_model(conn: sqlite3.Connection, model: str) -> None:
         ON CONFLICT(id) DO UPDATE SET model = excluded.model
         """,
         (model,),
+    )
+    conn.commit()
+
+
+def get_effort(conn: sqlite3.Connection) -> str:
+    row = conn.execute("SELECT effort FROM settings WHERE id = 1").fetchone()
+    return row["effort"] if row and row["effort"] is not None else DEFAULT_EFFORT
+
+
+def set_effort(conn: sqlite3.Connection, effort: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO settings (id, effort) VALUES (1, ?)
+        ON CONFLICT(id) DO UPDATE SET effort = excluded.effort
+        """,
+        (effort,),
     )
     conn.commit()
 
@@ -222,15 +255,26 @@ def create_session(
     phase: str = "grilling",
     details: dict | None = None,
     model: str | None = None,
+    effort: str | None = None,
 ) -> int:
     now = datetime.now(timezone.utc).isoformat()
     details_json = json.dumps(details) if details is not None else None
     cur = conn.execute(
         """
-        INSERT INTO sessions (project_id, claude_session_id, session_type, phase, details_json, model, last_activity, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO sessions (project_id, claude_session_id, session_type, phase, details_json, model, effort, last_activity, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (project_id, claude_session_id, session_type, phase, details_json, model or DEFAULT_MODEL, now, now),
+        (
+            project_id,
+            claude_session_id,
+            session_type,
+            phase,
+            details_json,
+            model or DEFAULT_MODEL,
+            effort or DEFAULT_EFFORT,
+            now,
+            now,
+        ),
     )
     conn.commit()
     return cur.lastrowid

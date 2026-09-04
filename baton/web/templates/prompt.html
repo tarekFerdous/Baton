@@ -10,20 +10,31 @@
   <div class="split">
     <div class="left-column">
     <div id="model-card" class="card left-secondary model-card">
-      <label for="model-select-card" class="model-card-label">Model</label>
-      <select id="model-select-card" class="model-select">
-        <optgroup label="Sonnet">
-          <option value="claude-sonnet-5">Sonnet 5</option>
-          <option value="claude-sonnet-4-6">Sonnet 4.6</option>
-        </optgroup>
-        <optgroup label="Opus">
-          <option value="claude-opus-5">Opus 5</option>
-          <option value="claude-opus-4-8">Opus 4.8</option>
-        </optgroup>
-        <optgroup label="Haiku">
-          <option value="claude-haiku-4-5">Haiku 4.5</option>
-        </optgroup>
-      </select>
+      <div class="model-field">
+        <label for="model-select-card" class="model-card-label">Model</label>
+        <select id="model-select-card" class="model-select">
+          <optgroup label="Sonnet">
+            <option value="claude-sonnet-5">Sonnet 5</option>
+            <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+          </optgroup>
+          <optgroup label="Opus">
+            <option value="claude-opus-5">Opus 5</option>
+            <option value="claude-opus-4-8">Opus 4.8</option>
+          </optgroup>
+          <optgroup label="Haiku">
+            <option value="claude-haiku-4-5">Haiku 4.5</option>
+          </optgroup>
+        </select>
+      </div>
+      <div class="model-field">
+        <label for="effort-select-card" class="model-card-label">Effort</label>
+        <select id="effort-select-card" class="model-select">
+          <option value="auto">Auto</option>
+          <option value="high">High</option>
+          <option value="medium">Medium</option>
+          <option value="low">Low</option>
+        </select>
+      </div>
     </div>
     <div class="card left">
       <button id="settings-gear" class="gear-btn" type="button" title="Settings">&#9881;</button>
@@ -91,6 +102,9 @@
         <input id="parallel-implementation-toggle" type="checkbox" class="modal-checkbox-input" />
         Run implementations in parallel
       </label>
+      <p id="parallel-implementation-warning" class="modal-warning-text" hidden>
+        Running multiple PRDs at once costs more tokens against your rate-limit budget than the sequential default.
+      </p>
 
       <label for="model-select-settings" class="modal-field-label">Model</label>
       <select id="model-select-settings" class="modal-select-input">
@@ -105,6 +119,14 @@
         <optgroup label="Haiku">
           <option value="claude-haiku-4-5">Haiku 4.5</option>
         </optgroup>
+      </select>
+
+      <label for="effort-select-settings" class="modal-field-label">Effort</label>
+      <select id="effort-select-settings" class="modal-select-input">
+        <option value="auto">Auto</option>
+        <option value="high">High</option>
+        <option value="medium">Medium</option>
+        <option value="low">Low</option>
       </select>
 
       <button id="modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
@@ -122,11 +144,27 @@
     </div>
   </div>
 
+  <div id="effort-change-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h2 id="effort-change-heading" class="modal-heading">Effort Updated</h2>
+      <p id="effort-change-text" class="model-change-text"></p>
+      <button id="effort-change-modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
+    </div>
+  </div>
+
   <div id="afk-notification-modal" class="modal-overlay" hidden>
     <div class="modal">
       <h2 class="modal-heading">AFK Implementation</h2>
       <div id="afk-notification-lines"></div>
       <button id="afk-modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
+    </div>
+  </div>
+
+  <div id="session-error-notification-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h2 class="modal-heading">Background Session Error</h2>
+      <div id="session-error-notification-lines"></div>
+      <button id="session-error-notification-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
     </div>
   </div>
 
@@ -159,10 +197,17 @@
     const currentRootDirEl = document.getElementById("current-root-dir");
     const afkHoursInputEl = document.getElementById("afk-hours-input");
     const parallelImplementationToggleEl = document.getElementById("parallel-implementation-toggle");
+    const parallelImplementationWarningEl = document.getElementById("parallel-implementation-warning");
     const modelSelectCardEl = document.getElementById("model-select-card");
     const modelSelectSettingsEl = document.getElementById("model-select-settings");
     const modelChangeModalEl = document.getElementById("model-change-modal");
     const modelChangeModalCloseBtn = document.getElementById("model-change-modal-close-btn");
+    const effortSelectCardEl = document.getElementById("effort-select-card");
+    const effortSelectSettingsEl = document.getElementById("effort-select-settings");
+    const effortChangeModalEl = document.getElementById("effort-change-modal");
+    const effortChangeHeadingEl = document.getElementById("effort-change-heading");
+    const effortChangeTextEl = document.getElementById("effort-change-text");
+    const effortChangeModalCloseBtn = document.getElementById("effort-change-modal-close-btn");
     const brandHeadingEl = document.getElementById("brand-heading");
     const sessionQueueEl = document.getElementById("session-queue");
     const consoleOutputEl = document.getElementById("console-output");
@@ -179,6 +224,9 @@
     const afkNotificationModalEl = document.getElementById("afk-notification-modal");
     const afkNotificationLinesEl = document.getElementById("afk-notification-lines");
     const afkModalCloseBtn = document.getElementById("afk-modal-close-btn");
+    const sessionErrorNotificationModalEl = document.getElementById("session-error-notification-modal");
+    const sessionErrorNotificationLinesEl = document.getElementById("session-error-notification-lines");
+    const sessionErrorNotificationCloseBtn = document.getElementById("session-error-notification-close-btn");
     const qaNotificationModalEl = document.getElementById("qa-notification-modal");
     const qaNotificationHeadingEl = document.getElementById("qa-notification-heading");
     const qaModalCloseBtnEl = document.getElementById("qa-modal-close-btn");
@@ -187,6 +235,13 @@
     let knownAfkHours = null;
     let knownParallelImplementation = null;
     let knownModel = null;
+    let knownEffort = null;
+    // card_id's that have received at least one turn -- gates whether
+    // changing the left-card effort dropdown applies immediately (not yet
+    // in this set) or is deferred to the next session (already in it).
+    // Never reset: each session gets a fresh row id, even a pooled/reused
+    // one, so membership never needs to be cleared.
+    const cardsWithTurn = new Set();
 
     function autoGrow(el) {
       el.style.height = "auto";
@@ -376,6 +431,7 @@
       await loadSessionQueue();
       await loadPrdList();
       await loadAfkNotifications();
+      await loadSessionErrorNotifications();
     }
 
     function renderAfkNotifications(notifications) {
@@ -401,6 +457,38 @@
       const res = await fetch(`/api/projects/${activeProject.id}/afk-notifications`);
       const data = await res.json();
       renderAfkNotifications(data.notifications || []);
+    }
+
+    function phaseLabelForNotification(phase) {
+      return { implementing: "Implementing", qa_closing: "QA" }[phase] || phase;
+    }
+
+    function renderSessionErrorNotifications(notifications) {
+      sessionErrorNotificationLinesEl.innerHTML = "";
+      if (!notifications || notifications.length === 0) {
+        sessionErrorNotificationModalEl.hidden = true;
+        return;
+      }
+
+      notifications.forEach((n) => {
+        const p = document.createElement("p");
+        p.textContent = `${phaseLabelForNotification(n.phase)} failed in the background: ${n.message}`;
+        sessionErrorNotificationLinesEl.appendChild(p);
+      });
+      sessionErrorNotificationModalEl.hidden = false;
+    }
+
+    async function loadSessionErrorNotifications() {
+      if (!activeProject) return;
+      const res = await fetch(`/api/projects/${activeProject.id}/session-error-notifications`);
+      const data = await res.json();
+      renderSessionErrorNotifications(data.notifications || []);
+    }
+
+    async function dismissSessionErrorNotifications() {
+      if (!activeProject) return;
+      await fetch(`/api/projects/${activeProject.id}/session-error-notifications/dismiss`, { method: "POST" });
+      renderSessionErrorNotifications([]);
     }
 
     async function dismissAfkNotifications() {
@@ -561,6 +649,7 @@
         }
       });
       await loadAfkNotifications();
+      await loadSessionErrorNotifications();
     }
 
     async function closeActiveProject() {
@@ -606,6 +695,9 @@
       knownModel = state.model;
       modelSelectCardEl.value = knownModel;
       modelSelectSettingsEl.value = knownModel;
+      knownEffort = state.effort;
+      effortSelectCardEl.value = knownEffort;
+      effortSelectSettingsEl.value = knownEffort;
 
       if (state.active_project) {
         await activateProject(state.active_project);
@@ -624,8 +716,10 @@
     function openSettingsModal() {
       currentRootDirEl.textContent = knownRootDir || "No directory set.";
       afkHoursInputEl.value = knownAfkHours ?? 6;
-      parallelImplementationToggleEl.checked = knownParallelImplementation ?? true;
+      parallelImplementationToggleEl.checked = knownParallelImplementation ?? false;
+      parallelImplementationWarningEl.hidden = !parallelImplementationToggleEl.checked;
       modelSelectSettingsEl.value = knownModel ?? "claude-sonnet-4-6";
+      effortSelectSettingsEl.value = knownEffort ?? "auto";
       settingsModalEl.hidden = false;
     }
 
@@ -660,6 +754,7 @@
       const data = await res.json();
       knownParallelImplementation = data.parallel_implementation;
       parallelImplementationToggleEl.checked = knownParallelImplementation;
+      parallelImplementationWarningEl.hidden = !knownParallelImplementation;
     }
 
     async function updateModel(model) {
@@ -673,6 +768,35 @@
       modelSelectCardEl.value = knownModel;
       modelSelectSettingsEl.value = knownModel;
       modelChangeModalEl.hidden = false;
+    }
+
+    async function updateEffort(effort) {
+      const res = await fetch("/api/settings/effort", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ effort }),
+      });
+      const data = await res.json();
+      knownEffort = data.effort;
+      effortSelectCardEl.value = knownEffort;
+      effortSelectSettingsEl.value = knownEffort;
+
+      // A left-card session that exists but hasn't received its first turn
+      // yet gets patched directly so that still-pending first turn picks up
+      // the new value; anything further along only gets the new global
+      // default, applied starting with the next session.
+      if (leftCardId !== null && !cardsWithTurn.has(leftCardId)) {
+        await fetch(`/api/sessions/${leftCardId}/effort`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ effort }),
+        });
+        effortChangeTextEl.textContent = "Applied to your current session immediately.";
+      } else {
+        effortChangeTextEl.textContent =
+          "This change takes effect starting with your next new session. Any session already in progress keeps using the effort it started with.";
+      }
+      effortChangeModalEl.hidden = false;
     }
 
     async function pickRootDir() {
@@ -706,11 +830,17 @@
     parallelImplementationToggleEl.addEventListener("change", updateParallelImplementation);
     document.getElementById("close-project-btn").addEventListener("click", closeActiveProject);
     afkModalCloseBtn.addEventListener("click", dismissAfkNotifications);
+    sessionErrorNotificationCloseBtn.addEventListener("click", dismissSessionErrorNotifications);
     qaModalCloseBtnEl.addEventListener("click", () => { qaNotificationModalEl.hidden = true; });
     modelSelectCardEl.addEventListener("change", () => updateModel(modelSelectCardEl.value));
     modelSelectSettingsEl.addEventListener("change", () => updateModel(modelSelectSettingsEl.value));
     modelChangeModalCloseBtn.addEventListener("click", () => {
       modelChangeModalEl.hidden = true;
+    });
+    effortSelectCardEl.addEventListener("change", () => updateEffort(effortSelectCardEl.value));
+    effortSelectSettingsEl.addEventListener("change", () => updateEffort(effortSelectSettingsEl.value));
+    effortChangeModalCloseBtn.addEventListener("click", () => {
+      effortChangeModalEl.hidden = true;
     });
 
     let eventSource = null;
@@ -859,6 +989,11 @@
         return;
       }
 
+      if (event.type === "minimize") {
+        minimizeLeftCardToBackground(cardId, es);
+        return;
+      }
+
       if (event.type === "done") {
         finishCard(cardId);
         es.close();
@@ -894,6 +1029,7 @@
     }
 
     function applyTurn(cardId, event) {
+      cardsWithTurn.add(cardId);
       if (cardId === leftCardId) currentTextEl = null;
       const snapshot = {
         card_id: cardId,
@@ -975,6 +1111,40 @@
       setHeading(headingForPhase(event.phase));
       showOnly(sessionStatusEl);
       renderSessionStatus(snapshot);
+    }
+
+    function minimizeLeftCardToBackground(cardId, es) {
+      // A `/do` session that just reached `details` and is auto-continuing
+      // into /implement (see session_runner._auto_continue_implement_and_qa)
+      // -- move it to the right-side queue and free the left card for a new
+      // /do immediately, same shape as the QA-takes-over-left-card move in
+      // applyTurn, but without another session displacing it: nothing new
+      // occupies the left card here, it just goes back to the empty "What
+      // are we doing?" state, ready for the next /do.
+      if (leftCardId !== cardId) return;
+
+      const snapshot = cardSnapshots.get(cardId);
+      if (snapshot) rightCards.set(cardId, snapshot);
+
+      if (eventSource === es) {
+        backgroundSources.set(cardId, es);
+        es.onmessage = (e) => handleStreamEvent(cardId, es, JSON.parse(e.data));
+        es.onerror = () => {
+          es.close();
+          backgroundSources.delete(cardId);
+        };
+        eventSource = null;
+      }
+
+      leftCardId = null;
+      currentLeftSession = null;
+      resetPromptBox();
+      startForm.style.display = "";
+      interviewEl.innerHTML = "";
+      setHeading("What are we doing?");
+      showOnly(mainFlowEl);
+
+      renderQueue();
     }
 
     function finishCard(cardId) {
@@ -1403,7 +1573,7 @@
       const res = await fetch("/api/session/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({ prompt, effort: effortSelectCardEl.value }),
       });
       const data = await res.json();
       submitBtn.disabled = false;

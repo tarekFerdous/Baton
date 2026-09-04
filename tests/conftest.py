@@ -36,3 +36,10 @@ def _isolated_afk_loop(monkeypatch):
     its per-project undismissed-notification queue."""
     monkeypatch.setattr(afk_loop, "_last_activity", {})
     monkeypatch.setattr(afk_loop, "_notifications", {})
+
+
+@pytest.fixture(autouse=True)
+def _isolated_error_notifications(monkeypatch):
+    """Same story again, but for session_runner's per-project undismissed
+    background-session-error notification queue."""
+    monkeypatch.setattr(session_runner, "_error_notifications", {})

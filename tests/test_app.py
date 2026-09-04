@@ -24,9 +24,9 @@ def test_set_afk_hours_persists_and_reflects_in_app_state(client):
     assert state["afk_hours"] == 12
 
 
-def test_app_state_defaults_parallel_implementation_to_true(client):
+def test_app_state_defaults_parallel_implementation_to_false(client):
     state = client.get("/api/app-state").json()
-    assert state["parallel_implementation"] is True
+    assert state["parallel_implementation"] is False
 
 
 def test_set_parallel_implementation_persists_and_reflects_in_app_state(client):
@@ -52,6 +52,69 @@ def test_set_model_persists_and_reflects_in_app_state(client):
 
     state = client.get("/api/app-state").json()
     assert state["model"] == "claude-opus-4-8"
+
+
+def test_app_state_defaults_effort_to_auto(client):
+    state = client.get("/api/app-state").json()
+    assert state["effort"] == "auto"
+
+
+def test_set_effort_persists_and_reflects_in_app_state(client):
+    resp = client.post("/api/settings/effort", json={"effort": "high"})
+    assert resp.json() == {"effort": "high"}
+
+    state = client.get("/api/app-state").json()
+    assert state["effort"] == "high"
+
+
+def _open_project(client, tmp_path, name):
+    root = tmp_path / name
+    root.mkdir()
+    _init_repo(root / "repo", f"https://github.com/x/{name}.git")
+    client.post("/api/settings/root-dir", json={"root_dir": str(root)})
+    project_id = client.get("/api/app-state").json()["projects"][0]["id"]
+    client.post(f"/api/projects/{project_id}/open")
+    return project_id
+
+
+def test_session_start_accepts_effort_and_seeds_the_session_row(client, tmp_path, monkeypatch):
+    _open_project(client, tmp_path, "proj")
+
+    async def _noop(card_id, prompt, *, cwd):
+        return None
+
+    monkeypatch.setattr(session_runner, "start_session_job", _noop)
+
+    resp = client.post("/api/session/start", json={"prompt": "a feature", "effort": "low"})
+    card_id = resp.json()["card_id"]
+
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    assert row["effort"] == "low"
+
+
+def test_patch_session_effort_updates_the_row_immediately(client, tmp_path, monkeypatch):
+    _open_project(client, tmp_path, "proj")
+
+    async def _noop(card_id, prompt, *, cwd):
+        return None
+
+    monkeypatch.setattr(session_runner, "start_session_job", _noop)
+
+    resp = client.post("/api/session/start", json={"prompt": "a feature", "effort": "auto"})
+    card_id = resp.json()["card_id"]
+
+    patch_resp = client.post(f"/api/sessions/{card_id}/effort", json={"effort": "medium"})
+    assert patch_resp.json() == {"effort": "medium"}
+
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    assert row["effort"] == "medium"
+
+
+def test_patch_session_effort_returns_error_for_unknown_session(client):
+    resp = client.post("/api/sessions/999999/effort", json={"effort": "high"})
+    assert resp.json() == {"error": "Session not found"}
 
 
 def test_root_dir_change_without_confirmation_leaves_projects_untouched(client, tmp_path):
@@ -160,6 +223,7 @@ def test_start_implement_endpoint_rejects_duplicate_session_for_same_prd(client,
     client.post("/api/settings/root-dir", json={"root_dir": str(root)})
     project_id = client.get("/api/app-state").json()["projects"][0]["id"]
     client.post(f"/api/projects/{project_id}/open")
+    client.post("/api/settings/parallel-implementation", json={"parallel_implementation": True})
 
     async def _noop_job(card_id, prd_number, *, cwd):
         return None
@@ -317,3 +381,19 @@ def test_qa_complete_endpoint_accepts_notes_and_returns_ok(client, tmp_path, mon
 def test_qa_complete_endpoint_returns_error_for_unknown_session(client):
     resp = client.post("/api/session/qa-complete", json={"card_id": 9999, "notes": ""})
     assert "error" in resp.json()
+
+
+def test_session_error_notifications_endpoint_round_trip(client, tmp_path):
+    _open_project(client, tmp_path, "proj")
+    project_id = client.get("/api/app-state").json()["active_project"]["id"]
+
+    assert client.get(f"/api/projects/{project_id}/session-error-notifications").json() == {"notifications": []}
+
+    session_runner.add_error_notification(project_id, 42, "implementing", "boom")
+
+    resp = client.get(f"/api/projects/{project_id}/session-error-notifications")
+    assert resp.json() == {"notifications": [{"card_id": 42, "phase": "implementing", "message": "boom"}]}
+
+    dismiss_resp = client.post(f"/api/projects/{project_id}/session-error-notifications/dismiss")
+    assert dismiss_resp.json() == {"dismissed": True}
+    assert client.get(f"/api/projects/{project_id}/session-error-notifications").json() == {"notifications": []}

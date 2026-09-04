@@ -9,6 +9,14 @@
 <body>
   <div class="split">
     <div class="left-column">
+    <div id="model-card" class="card left-secondary model-card">
+      <label for="model-select-card" class="model-card-label">Model</label>
+      <select id="model-select-card" class="model-select">
+        <option value="claude-sonnet-4-6">Sonnet</option>
+        <option value="claude-opus-4-8">Opus</option>
+        <option value="claude-haiku-4-5">Haiku</option>
+      </select>
+    </div>
     <div class="card left">
       <button id="settings-gear" class="gear-btn" type="button" title="Settings">&#9881;</button>
       <h1 class="brand" id="brand-heading">What are we doing?</h1>
@@ -76,7 +84,25 @@
         Run implementations in parallel
       </label>
 
+      <label for="model-select-settings" class="modal-field-label">Model</label>
+      <select id="model-select-settings" class="modal-select-input">
+        <option value="claude-sonnet-4-6">Sonnet</option>
+        <option value="claude-opus-4-8">Opus</option>
+        <option value="claude-haiku-4-5">Haiku</option>
+      </select>
+
       <button id="modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
+    </div>
+  </div>
+
+  <div id="model-change-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h2 class="modal-heading">Model Updated</h2>
+      <p class="model-change-text">
+        This change takes effect starting with your next new session. Any
+        session already in progress keeps using the model it started with.
+      </p>
+      <button id="model-change-modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
     </div>
   </div>
 
@@ -107,6 +133,10 @@
     const currentRootDirEl = document.getElementById("current-root-dir");
     const afkHoursInputEl = document.getElementById("afk-hours-input");
     const parallelImplementationToggleEl = document.getElementById("parallel-implementation-toggle");
+    const modelSelectCardEl = document.getElementById("model-select-card");
+    const modelSelectSettingsEl = document.getElementById("model-select-settings");
+    const modelChangeModalEl = document.getElementById("model-change-modal");
+    const modelChangeModalCloseBtn = document.getElementById("model-change-modal-close-btn");
     const brandHeadingEl = document.getElementById("brand-heading");
     const sessionQueueEl = document.getElementById("session-queue");
     const consoleOutputEl = document.getElementById("console-output");
@@ -127,6 +157,7 @@
     let knownRootDir = null;
     let knownAfkHours = null;
     let knownParallelImplementation = null;
+    let knownModel = null;
 
     function autoGrow(el) {
       el.style.height = "auto";
@@ -523,6 +554,9 @@
       knownRootDir = state.root_dir;
       knownAfkHours = state.afk_hours;
       knownParallelImplementation = state.parallel_implementation;
+      knownModel = state.model;
+      modelSelectCardEl.value = knownModel;
+      modelSelectSettingsEl.value = knownModel;
 
       if (state.active_project) {
         await activateProject(state.active_project);
@@ -542,6 +576,7 @@
       currentRootDirEl.textContent = knownRootDir || "No directory set.";
       afkHoursInputEl.value = knownAfkHours ?? 6;
       parallelImplementationToggleEl.checked = knownParallelImplementation ?? true;
+      modelSelectSettingsEl.value = knownModel ?? "claude-sonnet-4-6";
       settingsModalEl.hidden = false;
     }
 
@@ -578,6 +613,19 @@
       parallelImplementationToggleEl.checked = knownParallelImplementation;
     }
 
+    async function updateModel(model) {
+      const res = await fetch("/api/settings/model", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model }),
+      });
+      const data = await res.json();
+      knownModel = data.model;
+      modelSelectCardEl.value = knownModel;
+      modelSelectSettingsEl.value = knownModel;
+      modelChangeModalEl.hidden = false;
+    }
+
     async function pickRootDir() {
       const pickRes = await fetch("/api/settings/pick-folder", { method: "POST" });
       const { path } = await pickRes.json();
@@ -609,6 +657,11 @@
     parallelImplementationToggleEl.addEventListener("change", updateParallelImplementation);
     document.getElementById("close-project-btn").addEventListener("click", closeActiveProject);
     afkModalCloseBtn.addEventListener("click", dismissAfkNotifications);
+    modelSelectCardEl.addEventListener("change", () => updateModel(modelSelectCardEl.value));
+    modelSelectSettingsEl.addEventListener("change", () => updateModel(modelSelectSettingsEl.value));
+    modelChangeModalCloseBtn.addEventListener("click", () => {
+      modelChangeModalEl.hidden = true;
+    });
 
     let eventSource = null;
     let currentTextEl = null;

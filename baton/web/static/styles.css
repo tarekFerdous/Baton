@@ -192,6 +192,31 @@ textarea.prompt-box:focus {
   display: none;
 }
 
+.card.model-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.model-card-label {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  font-variation-settings: "MONO" 0, "CASL" 0, "wght" 600, "slnt" 0, "CRSV" 0;
+}
+
+.model-select {
+  flex: 0 0 auto;
+  background: var(--bg);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  padding: 8px 12px;
+  font-size: 0.85rem;
+  font-family: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
 .prd-button-row {
   display: flex;
   flex-wrap: nowrap;
@@ -442,6 +467,20 @@ textarea.prompt-box:focus {
   height: 16px;
   margin: 0;
   accent-color: var(--glass-bg);
+  cursor: pointer;
+}
+
+.modal-select-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 0.9rem;
+  font-family: inherit;
+  color: inherit;
+  margin-bottom: 20px;
   cursor: pointer;
 }
 

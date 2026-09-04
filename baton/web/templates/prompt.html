@@ -294,6 +294,7 @@
       activeProject = project;
       activeProjectNameEl.textContent = project.name;
       activeProjectLineEl.hidden = false;
+      updatePolls();
 
       leftCardId = null;
       currentLeftSession = null;
@@ -500,6 +501,7 @@
       });
 
       activeProject = null;
+      updatePolls();
       leftCardId = null;
       currentLeftSession = null;
       rightCards.clear();
@@ -726,6 +728,13 @@
         showOnly(mainFlowEl);
       }
       renderQueue();
+
+      // A finishing `do` session means the grilling -> PRD -> issues chain
+      // just completed; a finishing `implement` session means a PRD just
+      // got implemented. Either way the "To be implemented" list is stale.
+      if (snapshot.session_type === "do" || snapshot.session_type === "implement") {
+        loadPrdList();
+      }
     }
 
     function renderManualReply(onSend) {
@@ -1042,10 +1051,45 @@
       const fmt = (v) => (v == null ? "—" : `${Math.round(v)}%`);
       usageIndicatorEl.textContent = `5h ${fmt(data.five_hour_pct)} · 7d ${fmt(data.seven_day_pct)}`;
     }
-    setInterval(refreshUsage, 8000);
-    refreshUsage();
-    setInterval(pollSessionQueueFreshness, 4000);
-    setInterval(loadPrdList, 30000);
+    // refreshUsage (8s) and pollSessionQueueFreshness (4s) only run while
+    // there's an active project and the tab is visible -- no point spamming
+    // the backend (and, for the session poll, `gh`) when there's nothing to
+    // watch or nobody watching. loadPrdList is intentionally not part of
+    // this timer-driven lifecycle: it's event-driven only (see activateProject
+    // and finishCard) since its endpoint is the expensive one (two `gh
+    // issue list` subprocesses per call).
+    let usageIntervalId = null;
+    let sessionQueueIntervalId = null;
+
+    function pollsShouldRun() {
+      return Boolean(activeProject) && document.visibilityState === "visible";
+    }
+
+    function startPolls() {
+      if (usageIntervalId) return; // already running
+      refreshUsage();
+      usageIntervalId = setInterval(refreshUsage, 8000);
+      pollSessionQueueFreshness();
+      sessionQueueIntervalId = setInterval(pollSessionQueueFreshness, 4000);
+    }
+
+    function stopPolls() {
+      if (usageIntervalId) {
+        clearInterval(usageIntervalId);
+        usageIntervalId = null;
+      }
+      if (sessionQueueIntervalId) {
+        clearInterval(sessionQueueIntervalId);
+        sessionQueueIntervalId = null;
+      }
+    }
+
+    function updatePolls() {
+      if (pollsShouldRun()) startPolls();
+      else stopPolls();
+    }
+
+    document.addEventListener("visibilitychange", updatePolls);
 
     loadAppState();
   </script>

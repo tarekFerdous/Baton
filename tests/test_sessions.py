@@ -5,6 +5,7 @@ from pathlib import Path
 
 from baton import db, live_stream, session_runner
 from baton.cli_client import ClaudeCLIError
+from baton.github_publisher import GithubPublishError
 
 
 def _init_repo(path, remote_url):
@@ -288,13 +289,16 @@ def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, 
     def fake_stream_prompt(prompt, **kw):
         seen_prompts.append(prompt)
         if prompt == "/to-prd":
-            return iter([_result_event("Published PRD #5: My PRD")])
+            return iter([_result_event("Wrote PRD draft.")])
         if prompt == "/to-issues":
-            return iter([_result_event("Issue #6: Child one")])
+            return iter([_result_event("Wrote issues draft.")])
         raise AssertionError(f"unexpected grilling-style prompt {prompt!r} during confirm_advance")
 
     monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
     monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "s2")
+    monkeypatch.setattr(
+        session_runner, "publish_draft", lambda draft_path, cwd: "PRD #5: My PRD\nIssue #6: Child one"
+    )
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
@@ -456,14 +460,19 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
 
     def fake_stream_prompt(prompt, **kw):
         if prompt == "/to-prd":
-            return iter([_result_event("Published PRD #5: My PRD")])
+            return iter([_result_event("Wrote PRD draft.")])
         if prompt == "/to-issues":
-            return iter([_result_event("Issue #6: Child one\nIssue #7: Child two")])
+            return iter([_result_event("Wrote issues draft.")])
         # the grilling reply itself: no more bullet/heading questions -> grilling is done
         return iter([_result_event("Thanks, that's everything I need.")])
 
     monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
     monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "s2")
+    monkeypatch.setattr(
+        session_runner,
+        "publish_draft",
+        lambda draft_path, cwd: "PRD #5: My PRD\nIssue #6: Child one\nIssue #7: Child two",
+    )
 
     # The grilling reply itself: no more questions -> stays in grilling and
     # publishes the wrap-up turn, no auto-advance.
@@ -490,6 +499,153 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
     assert any(e.get("type") == "turn" and e.get("phase") == "details" for e in events)
     assert any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
     assert "$" not in json.dumps(events)
+
+
+def test_confirm_advance_runs_publishing_phase_with_no_extra_cli_calls(client, tmp_path, monkeypatch):
+    """Issue #58: the chain must sequence phase:creating_prd -> phase:creating_issues
+    -> phase:publishing -> turn(details) -> done, and github_publisher.publish_draft
+    (not a Claude CLI turn) must be what actually creates the GitHub issues --
+    stream_prompt is only ever invoked for /to-prd and /to-issues."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    monkeypatch.setattr(
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
+    )
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    seen_prompts = []
+
+    def fake_stream_prompt(prompt, **kw):
+        seen_prompts.append(prompt)
+        if prompt == "/to-prd":
+            return iter([_result_event("Wrote PRD draft.")])
+        if prompt == "/to-issues":
+            return iter([_result_event("Wrote issues draft.")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
+
+    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "s2")
+
+    seen_publish_calls = []
+
+    def fake_publish_draft(draft_path, cwd):
+        seen_publish_calls.append((draft_path, cwd))
+        return "PRD #5: My PRD\nIssue #6: Child one"
+
+    monkeypatch.setattr(session_runner, "publish_draft", fake_publish_draft)
+
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+
+    # Only /to-prd and /to-issues ever went through the Claude CLI -- publishing did not.
+    assert seen_prompts == ["/to-prd", "/to-issues"]
+    assert len(seen_publish_calls) == 1
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "details"
+    details = json.loads(row["details_json"])
+    assert details["prd"] == {"number": 5, "title": "My PRD"}
+    assert details["issues"] == [{"number": 6, "title": "Child one"}]
+    assert row["available_for_reuse"] == 1
+
+    events = live_stream._buffers.get(row_id, [])
+    chain_phases = [
+        e["phase"] for e in events if e.get("type") == "phase" and e["phase"] != "grilling"
+    ]
+    assert chain_phases == ["creating_prd", "creating_issues", "publishing"]
+    assert events[-1] == {"type": "done"}
+    assert any(e.get("type") == "turn" and e.get("phase") == "details" for e in events)
+
+
+def test_publish_draft_failure_stops_chain_with_error_turn(client, tmp_path, monkeypatch):
+    """Issue #58: a GithubPublishError from publish_draft() must be caught,
+    logged as an error turn event (same shape as _run_chain_step failures),
+    followed by done -- with no unhandled exception -- and the chain must
+    stop before _finish_chain ever runs."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    monkeypatch.setattr(
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
+    )
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    def fake_stream_prompt(prompt, **kw):
+        if prompt == "/to-prd":
+            return iter([_result_event("Wrote PRD draft.")])
+        if prompt == "/to-issues":
+            return iter([_result_event("Wrote issues draft.")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
+
+    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
+
+    def failing_publish_draft(draft_path, cwd):
+        raise GithubPublishError("gh: not logged in, run `gh auth login`")
+
+    monkeypatch.setattr(session_runner, "publish_draft", failing_publish_draft)
+
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "publishing"
+    assert bool(row["needs_github_login"]) is True
+    assert "not logged in" in row["error_text"]
+    # The chain never reached _finish_chain.
+    assert row["details_json"] is None
+    assert row["available_for_reuse"] == 0
+
+    events = live_stream._buffers.get(row_id, [])
+    assert events[-1] == {"type": "done"}
+    error_turns = [e for e in events if e.get("type") == "turn" and e.get("phase") == "publishing"]
+    assert len(error_turns) == 1
+    assert "not logged in" in error_turns[0]["error"]
+
+
+def test_retry_on_publishing_phase_reruns_publisher_and_completes(client, tmp_path, monkeypatch):
+    """Issue #58: retry_session_job must handle phase == 'publishing' -- a
+    session stuck there (the publisher errored, or the app restarted
+    mid-phase) resumes by re-running the publisher and completing the chain."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    monkeypatch.setattr(
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
+    )
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    monkeypatch.setattr(
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("draft written")])
+    )
+
+    def failing_publish_draft(draft_path, cwd):
+        raise GithubPublishError("gh rate limited")
+
+    monkeypatch.setattr(session_runner, "publish_draft", failing_publish_draft)
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "publishing"
+    assert "gh rate limited" in row["error_text"]
+
+    monkeypatch.setattr(
+        session_runner, "publish_draft", lambda draft_path, cwd: "PRD #9: Retried PRD\nIssue #10: Only child"
+    )
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "s2")
+
+    asyncio.run(session_runner.retry_session_job(row_id, cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "details"
+    assert row["error_text"] is None
+    details = json.loads(row["details_json"])
+    assert details["prd"] == {"number": 9, "title": "Retried PRD"}
+    assert details["issues"] == [{"number": 10, "title": "Only child"}]
 
 
 def test_to_prd_auth_failure_sets_error_and_needs_github_login(client, tmp_path, monkeypatch):
@@ -542,13 +698,16 @@ def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypa
 
     def fake_stream_prompt(prompt, **kw):
         if prompt == "/to-prd":
-            return iter([_result_event("PRD #9: Retried PRD")])
+            return iter([_result_event("Wrote PRD draft.")])
         if prompt == "/to-issues":
-            return iter([_result_event("Issue #10: Only child")])
+            return iter([_result_event("Wrote issues draft.")])
         return iter([_result_event("done")])
 
     monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
     monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "s2")
+    monkeypatch.setattr(
+        session_runner, "publish_draft", lambda draft_path, cwd: "PRD #9: Retried PRD\nIssue #10: Only child"
+    )
 
     asyncio.run(session_runner.retry_session_job(row_id, cwd))
 
@@ -667,13 +826,16 @@ def test_retry_on_creating_prd_phase_is_unaffected_by_implement_branch(client, t
 
     def fake_stream_prompt(prompt, **kw):
         if prompt == "/to-prd":
-            return iter([_result_event("PRD #30: Regression PRD")])
+            return iter([_result_event("Wrote PRD draft.")])
         if prompt == "/to-issues":
-            return iter([_result_event("Issue #31: Only child")])
+            return iter([_result_event("Wrote issues draft.")])
         return iter([_result_event("done")])
 
     monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
     monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "s2")
+    monkeypatch.setattr(
+        session_runner, "publish_draft", lambda draft_path, cwd: "PRD #30: Regression PRD\nIssue #31: Only child"
+    )
 
     asyncio.run(session_runner.retry_session_job(row_id, cwd))
 
@@ -922,11 +1084,12 @@ def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch)
 
     def fake_stream_prompt(prompt, **kw):
         if prompt in ("/to-prd", "/to-issues"):
-            return iter([_result_event("PRD #1: p\nIssue #2: i")])
+            return iter([_result_event("wrote draft")])
         return iter([_result_event("done")])
 
     monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
     monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "pooled-session")
+    monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd: "PRD #1: p\nIssue #2: i")
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd_a, confirm_advance=True))
 
     row = db.get_session(conn, row_id)

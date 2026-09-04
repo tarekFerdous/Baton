@@ -17,6 +17,7 @@ _QA_GRILLING_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```")
 
 from baton import db
 from baton.cli_client import ClaudeCLIError, clear_session, stream_prompt
+from baton.github_publisher import GithubPublishError, publish_draft
 from baton.live_stream import publish
 from baton.qa_parser import parse_grilling_response
 from baton.stream_translate import translate_event
@@ -181,6 +182,37 @@ async def _run_chain_step(
     return True, turn["session_id"]
 
 
+async def _run_publish_step(card_id: int, conn, row, *, cwd: str | None) -> bool:
+    """Run the publishing step: reads `.claude/prd_draft.json` and calls
+    `github_publisher.publish_draft()` in a background thread -- a purely
+    scripted `gh` operation, no Claude CLI turn involved. Returns True on
+    success, having appended the publisher's result text to `console_text`
+    so `_finish_chain`'s `parse_details()` can parse PRD/issue numbers
+    unchanged. Returns False on failure, having published the error `turn`
+    and `done` itself here -- exactly like `_run_chain_step` does."""
+    db.update_session(conn, row["id"], phase="publishing", error_text=None, needs_github_login=0)
+    publish(card_id, {"type": "phase", "phase": "publishing"})
+
+    draft_path = Path(cwd) / ".claude" / "prd_draft.json" if cwd else Path(".claude/prd_draft.json")
+
+    try:
+        result_text = await asyncio.to_thread(publish_draft, draft_path, cwd)
+    except GithubPublishError as e:
+        message = str(e)
+        needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
+        db.update_session(conn, row["id"], error_text=message, needs_github_login=needs_login)
+        publish(card_id, _turn_event(phase="publishing", error=message, needs_github_login=bool(needs_login)))
+        publish(card_id, {"type": "done"})
+        return False
+
+    db.update_session(
+        conn,
+        row["id"],
+        console_text=row["console_text"] + "\n\n" + result_text if row["console_text"] else result_text,
+    )
+    return True
+
+
 async def _finish_chain(card_id: int, conn, claude_session_id: str, cwd: str | None) -> None:
     row = db.get_session(conn, card_id)
     details = parse_details(row["console_text"])
@@ -210,6 +242,11 @@ async def advance_past_grilling(card_id: int, cwd: str | None) -> None:
     ok, claude_session_id = await _run_chain_step(
         card_id, conn, row, phase="creating_issues", prompt="/to-issues", cwd=cwd, model=model
     )
+    if not ok:
+        return
+
+    row = db.get_session(conn, card_id)
+    ok = await _run_publish_step(card_id, conn, row, cwd=cwd)
     if not ok:
         return
 
@@ -502,4 +539,11 @@ async def retry_session_job(card_id: int, cwd: str | None) -> None:
             card_id, conn, row, phase="creating_issues", prompt="/to-issues", cwd=cwd, model=row["model"]
         )
         if ok:
-            await _finish_chain(card_id, conn, claude_session_id, cwd)
+            row = db.get_session(conn, card_id)
+            ok = await _run_publish_step(card_id, conn, row, cwd=cwd)
+            if ok:
+                await _finish_chain(card_id, conn, claude_session_id, cwd)
+    elif row["phase"] == "publishing":
+        ok = await _run_publish_step(card_id, conn, row, cwd=cwd)
+        if ok:
+            await _finish_chain(card_id, conn, row["claude_session_id"], cwd)

@@ -12,6 +12,12 @@ from pathlib import Path
 
 DEFAULT_DB_PATH = Path.home() / ".baton" / "baton.db"
 
+# The model Baton passes to every `claude` CLI invocation (via `--model`)
+# unless a session already has one recorded -- see `get_model`/`set_model`
+# (the global setting) and the `sessions.model` column (the value a given
+# session was created with) below.
+DEFAULT_MODEL = "claude-sonnet-4-6"
+
 
 def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     path = db_path or DEFAULT_DB_PATH
@@ -42,6 +48,10 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     if "parallel_implementation" not in existing_columns:
         conn.execute(
             "ALTER TABLE settings ADD COLUMN parallel_implementation INTEGER NOT NULL DEFAULT 1"
+        )
+    if "model" not in existing_columns:
+        conn.execute(
+            f"ALTER TABLE settings ADD COLUMN model TEXT NOT NULL DEFAULT '{DEFAULT_MODEL}'"
         )
     conn.execute(
         """
@@ -79,6 +89,10 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     session_columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
     if "session_type" not in session_columns:
         conn.execute("ALTER TABLE sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'do'")
+    if "model" not in session_columns:
+        conn.execute(
+            f"ALTER TABLE sessions ADD COLUMN model TEXT NOT NULL DEFAULT '{DEFAULT_MODEL}'"
+        )
     conn.commit()
     return conn
 
@@ -127,6 +141,22 @@ def set_parallel_implementation(conn: sqlite3.Connection, value: bool) -> None:
         ON CONFLICT(id) DO UPDATE SET parallel_implementation = excluded.parallel_implementation
         """,
         (1 if value else 0,),
+    )
+    conn.commit()
+
+
+def get_model(conn: sqlite3.Connection) -> str:
+    row = conn.execute("SELECT model FROM settings WHERE id = 1").fetchone()
+    return row["model"] if row and row["model"] is not None else DEFAULT_MODEL
+
+
+def set_model(conn: sqlite3.Connection, model: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO settings (id, model) VALUES (1, ?)
+        ON CONFLICT(id) DO UPDATE SET model = excluded.model
+        """,
+        (model,),
     )
     conn.commit()
 
@@ -191,15 +221,16 @@ def create_session(
     session_type: str = "do",
     phase: str = "grilling",
     details: dict | None = None,
+    model: str | None = None,
 ) -> int:
     now = datetime.now(timezone.utc).isoformat()
     details_json = json.dumps(details) if details is not None else None
     cur = conn.execute(
         """
-        INSERT INTO sessions (project_id, claude_session_id, session_type, phase, details_json, last_activity, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO sessions (project_id, claude_session_id, session_type, phase, details_json, model, last_activity, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (project_id, claude_session_id, session_type, phase, details_json, now, now),
+        (project_id, claude_session_id, session_type, phase, details_json, model or DEFAULT_MODEL, now, now),
     )
     conn.commit()
     return cur.lastrowid

@@ -51,7 +51,9 @@ def parse_details(text: str) -> dict:
     return {"prd": prd, "issues": issues, "raw": text}
 
 
-async def _run_turn(card_id: int, prompt: str, *, session_id: str | None, cwd: str | None) -> dict:
+async def _run_turn(
+    card_id: int, prompt: str, *, session_id: str | None, cwd: str | None, model: str | None = None
+) -> dict:
     """Run one CLI turn in a background thread, streaming translated events
     into the session's live buffer as they arrive. Returns the raw `result`
     event's translated boundary marker ({"result", "session_id", "is_error"})
@@ -61,7 +63,7 @@ async def _run_turn(card_id: int, prompt: str, *, session_id: str | None, cwd: s
     holder: dict = {}
 
     def worker():
-        for raw_event in stream_prompt(prompt, session_id=session_id, cwd=cwd):
+        for raw_event in stream_prompt(prompt, session_id=session_id, cwd=cwd, model=model):
             translated = translate_event(raw_event)
             if translated is None:
                 continue
@@ -99,11 +101,17 @@ def _turn_event(*, phase: str, interview=None, details=None, error=None, needs_g
 
 
 async def _run_grilling_turn(
-    card_id: int, conn, row, prompt: str, *, cwd: str | None, publish_when_empty: bool = False
+    card_id: int, conn, row, prompt: str, *, cwd: str | None, model: str | None, publish_when_empty: bool = False
 ) -> dict | None:
     """Run one grilling-phase turn and publish its `turn` event. Returns the
     parsed interview dict if grilling is still ongoing, `None` if this turn
     finished grilling (no more questions) or failed.
+
+    `model` is the model this *session* (not just this turn) was created
+    with -- see `start_session_job`/`continue_session_job` for where it comes
+    from. It's persisted back onto the row alongside the other per-turn
+    fields so a later call (a follow-up reply, a retry) can keep reading it
+    off the row instead of re-checking the current setting.
 
     `publish_when_empty` covers `start_session_job`: a brand-new session's
     very first turn must always render (even a bare preamble with no
@@ -116,11 +124,11 @@ async def _run_grilling_turn(
     publish(card_id, {"type": "phase", "phase": "grilling"})
 
     try:
-        turn = await _run_turn(card_id, prompt, session_id=row["claude_session_id"], cwd=cwd)
+        turn = await _run_turn(card_id, prompt, session_id=row["claude_session_id"], cwd=cwd, model=model)
     except ClaudeCLIError as e:
         message = str(e)
         needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
-        db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
+        db.update_session(conn, card_id, model=model, error_text=message, needs_github_login=needs_login)
         publish(card_id, _turn_event(phase="grilling", error=message, needs_github_login=bool(needs_login)))
         return None
 
@@ -129,6 +137,7 @@ async def _run_grilling_turn(
     db.update_session(
         conn,
         card_id,
+        model=model,
         claude_session_id=turn["session_id"],
         console_text=console_text,
         interview_json=json.dumps(parsed),
@@ -140,7 +149,9 @@ async def _run_grilling_turn(
     return parsed if parsed["sections"] else None
 
 
-async def _run_chain_step(card_id: int, conn, row, *, phase: str, prompt: str, cwd: str | None) -> tuple[bool, str | None]:
+async def _run_chain_step(
+    card_id: int, conn, row, *, phase: str, prompt: str, cwd: str | None, model: str | None
+) -> tuple[bool, str | None]:
     """Run one /to-prd or /to-issues step, live-streamed. Returns (ok, claude_session_id).
 
     On failure, publishes the error `turn` event and `done` itself -- the
@@ -150,7 +161,7 @@ async def _run_chain_step(card_id: int, conn, row, *, phase: str, prompt: str, c
     publish(card_id, {"type": "phase", "phase": phase})
 
     try:
-        turn = await _run_turn(card_id, prompt, session_id=row["claude_session_id"], cwd=cwd)
+        turn = await _run_turn(card_id, prompt, session_id=row["claude_session_id"], cwd=cwd, model=model)
     except ClaudeCLIError as e:
         message = str(e)
         needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
@@ -173,7 +184,7 @@ async def _finish_chain(card_id: int, conn, claude_session_id: str, cwd: str | N
     details = parse_details(row["console_text"])
     db.update_session(conn, card_id, phase="details", details_json=json.dumps(details))
 
-    new_session_id = await asyncio.to_thread(clear_session, claude_session_id, cwd=cwd)
+    new_session_id = await asyncio.to_thread(clear_session, claude_session_id, cwd=cwd, model=row["model"])
     db.mark_session_available(conn, card_id, new_session_id)
 
     publish(card_id, _turn_event(phase="details", details=details))
@@ -182,16 +193,20 @@ async def _finish_chain(card_id: int, conn, claude_session_id: str, cwd: str | N
 
 async def advance_past_grilling(card_id: int, cwd: str | None) -> None:
     """Grilling just finished: run /to-prd, /to-issues (live-streamed), then
-    auto-/clear and pool the session."""
+    auto-/clear and pool the session. Uses the model already recorded on the
+    row (set back when the session started grilling) -- this is a
+    continuation of that same session, not a fresh one, so the configured
+    model is not re-read here even if it's changed since."""
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
-    ok, _ = await _run_chain_step(card_id, conn, row, phase="creating_prd", prompt="/to-prd", cwd=cwd)
+    model = row["model"]
+    ok, _ = await _run_chain_step(card_id, conn, row, phase="creating_prd", prompt="/to-prd", cwd=cwd, model=model)
     if not ok:
         return
 
     row = db.get_session(conn, card_id)
     ok, claude_session_id = await _run_chain_step(
-        card_id, conn, row, phase="creating_issues", prompt="/to-issues", cwd=cwd
+        card_id, conn, row, phase="creating_issues", prompt="/to-issues", cwd=cwd, model=model
     )
     if not ok:
         return
@@ -200,9 +215,14 @@ async def advance_past_grilling(card_id: int, cwd: str | None) -> None:
 
 
 async def start_session_job(card_id: int, prompt: str, *, cwd: str | None) -> None:
+    """A brand-new grilling session begins here -- read the currently
+    configured model once, now, and use it for this session's entire
+    lifetime (later turns read it back off the row instead of re-checking
+    the setting)."""
     conn = db.get_connection()
+    model = db.get_model(conn)
     row = db.get_session(conn, card_id)
-    await _run_grilling_turn(card_id, conn, row, f"/do {prompt}", cwd=cwd, publish_when_empty=True)
+    await _run_grilling_turn(card_id, conn, row, f"/do {prompt}", cwd=cwd, model=model, publish_when_empty=True)
 
 
 async def continue_session_job(card_id: int, reply: str, *, cwd: str | None, confirm_advance: bool = False) -> None:
@@ -219,14 +239,15 @@ async def continue_session_job(card_id: int, reply: str, *, cwd: str | None, con
     `confirm_advance=True` skips running a grilling CLI turn entirely and
     goes straight to `advance_past_grilling`, resuming the session's existing
     `claude_session_id` -- exactly like `retry_session_job` does for a
-    `creating_prd` row."""
+    `creating_prd` row. Both paths use the model already recorded on the row
+    -- this is a continuation of an existing session, not a fresh one."""
     if confirm_advance:
         await advance_past_grilling(card_id, cwd)
         return
 
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
-    await _run_grilling_turn(card_id, conn, row, reply, cwd=cwd, publish_when_empty=True)
+    await _run_grilling_turn(card_id, conn, row, reply, cwd=cwd, model=row["model"], publish_when_empty=True)
 
 
 def _read_tracker_file(cwd: str | None) -> dict | None:
@@ -246,9 +267,14 @@ def _read_tracker_file(cwd: str | None) -> dict | None:
 def _launch_implement(conn, project_id: int, number: int, title: str, cwd: str | None) -> int:
     """Claim a pooled session (if any), create the session row, and fire the
     background `/implement` job -- the shared plumbing behind both an
-    immediate PRD click and a queued PRD's turn coming up in serial mode."""
+    immediate PRD click and a queued PRD's turn coming up in serial mode.
+
+    A fresh implement session begins here -- read the currently configured
+    model once, now, and record it on the new row so `start_implement_job`
+    (and any later retry of *this* row) uses it for the row's lifetime."""
     reused = db.claim_available_session(conn, project_id)
     resume_id = reused["claude_session_id"] if reused is not None else None
+    model = db.get_model(conn)
 
     row_id = db.create_session(
         conn,
@@ -257,6 +283,7 @@ def _launch_implement(conn, project_id: int, number: int, title: str, cwd: str |
         session_type="implement",
         phase="implementing",
         details={"prd": {"number": number, "title": title}},
+        model=model,
     )
 
     asyncio.create_task(start_implement_job(row_id, number, cwd=cwd))
@@ -312,11 +339,12 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
     chain does."""
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
+    model = row["model"]
     publish(card_id, {"type": "phase", "phase": "implementing"})
 
     try:
         turn = await _run_turn(
-            card_id, f"/implement prd: {prd_number}", session_id=row["claude_session_id"], cwd=cwd
+            card_id, f"/implement prd: {prd_number}", session_id=row["claude_session_id"], cwd=cwd, model=model
         )
     except ClaudeCLIError as e:
         message = str(e)
@@ -343,7 +371,7 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
         details_json=json.dumps(details) if details is not None else None,
     )
 
-    new_session_id = await asyncio.to_thread(clear_session, turn["session_id"], cwd=cwd)
+    new_session_id = await asyncio.to_thread(clear_session, turn["session_id"], cwd=cwd, model=model)
     db.mark_session_available(conn, card_id, new_session_id)
 
     publish(card_id, _turn_event(phase="implemented", details=details))
@@ -381,7 +409,7 @@ async def retry_session_job(card_id: int, cwd: str | None) -> None:
         await advance_past_grilling(card_id, cwd)
     elif row["phase"] == "creating_issues":
         ok, claude_session_id = await _run_chain_step(
-            card_id, conn, row, phase="creating_issues", prompt="/to-issues", cwd=cwd
+            card_id, conn, row, phase="creating_issues", prompt="/to-issues", cwd=cwd, model=row["model"]
         )
         if ok:
             await _finish_chain(card_id, conn, claude_session_id, cwd)

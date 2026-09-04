@@ -294,7 +294,7 @@ def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, 
         raise AssertionError(f"unexpected grilling-style prompt {prompt!r} during confirm_advance")
 
     monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "s2")
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "s2")
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
@@ -313,6 +313,134 @@ def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, 
     assert any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
     assert any(e == {"type": "phase", "phase": "creating_issues"} for e in events)
     assert any(e.get("type") == "turn" and e.get("phase") == "details" for e in events)
+
+
+def test_start_session_job_passes_the_configured_model_to_the_cli(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    db.set_model(conn, "claude-opus-4-8")
+
+    seen_models = []
+
+    def recording_stream_prompt(prompt, *, session_id=None, cwd=None, model=None):
+        seen_models.append(model)
+        return iter([_result_event("- Only question?")])
+
+    monkeypatch.setattr(session_runner, "stream_prompt", recording_stream_prompt)
+
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    assert seen_models == ["claude-opus-4-8"]
+    # The model actually used is persisted onto the row for later turns.
+    assert db.get_session(conn, row_id)["model"] == "claude-opus-4-8"
+
+
+def test_start_implement_job_passes_the_model_the_session_was_launched_with(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    db.set_model(conn, "claude-opus-4-8")
+
+    seen_models = []
+
+    def recording_stream_prompt(prompt, *, session_id=None, cwd=None, model=None):
+        seen_models.append(model)
+        return iter([_result_event("Implemented PRD #5", session_id="impl1")])
+
+    monkeypatch.setattr(session_runner, "stream_prompt", recording_stream_prompt)
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "pooled-1")
+
+    started = asyncio.run(session_runner.start_or_queue_implement(project_id, 5, "My PRD", cwd))
+    card_id = started["card_id"]
+
+    assert seen_models == ["claude-opus-4-8"]
+    assert db.get_session(conn, card_id)["model"] == "claude-opus-4-8"
+
+
+def test_chain_steps_use_the_model_the_session_was_created_with(client, tmp_path, monkeypatch):
+    """/to-prd and /to-issues (run via advance_past_grilling) must be
+    invoked with the same model the session's grilling turn used, not
+    whatever `settings.model` currently is."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    db.set_model(conn, "claude-opus-4-8")
+
+    monkeypatch.setattr(
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("- Only question?")])
+    )
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    seen_models = []
+
+    def recording_stream_prompt(prompt, *, session_id=None, cwd=None, model=None):
+        seen_models.append((prompt, model))
+        if prompt == "/to-prd":
+            return iter([_result_event("PRD #5: My PRD")])
+        if prompt == "/to-issues":
+            return iter([_result_event("Issue #6: Child one")])
+        return iter([_result_event("Thanks, that's everything I need.")])
+
+    monkeypatch.setattr(session_runner, "stream_prompt", recording_stream_prompt)
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "s2")
+
+    asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+
+    assert seen_models == [
+        ("all good", "claude-opus-4-8"),
+        ("/to-prd", "claude-opus-4-8"),
+        ("/to-issues", "claude-opus-4-8"),
+    ]
+
+
+def test_in_flight_session_keeps_its_original_model_after_setting_changes_mid_session(client, tmp_path, monkeypatch):
+    """A session already grilling must keep using the model it started with,
+    even if `settings.model` is changed before its later turns run."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    db.set_model(conn, "claude-opus-4-8")
+
+    monkeypatch.setattr(
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("- First question?")])
+    )
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    # Setting changes mid-session -- this row must not pick it up.
+    db.set_model(conn, "claude-sonnet-4-6")
+
+    seen_models = []
+
+    def recording_stream_prompt(prompt, *, session_id=None, cwd=None, model=None):
+        seen_models.append(model)
+        return iter([_result_event("Thanks, that's everything I need.")])
+
+    monkeypatch.setattr(session_runner, "stream_prompt", recording_stream_prompt)
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "s2")
+
+    asyncio.run(session_runner.continue_session_job(row_id, "a reply", cwd=cwd))
+
+    assert all(m == "claude-opus-4-8" for m in seen_models)
+
+    # A brand-new session started after the change picks up the new setting.
+    new_row_id = db.create_session(conn, project_id)
+    seen_models.clear()
+    monkeypatch.setattr(
+        session_runner,
+        "stream_prompt",
+        lambda prompt, **kw: (seen_models.append(kw.get("model")), iter([_result_event("- Q?")]))[1],
+    )
+    asyncio.run(session_runner.start_session_job(new_row_id, "another feature", cwd=cwd))
+    assert seen_models == ["claude-sonnet-4-6"]
 
 
 def test_continue_session_job_advances_through_prd_and_issues_to_details(client, tmp_path, monkeypatch):
@@ -335,7 +463,7 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
         return iter([_result_event("Thanks, that's everything I need.")])
 
     monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "s2")
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "s2")
 
     # The grilling reply itself: no more questions -> stays in grilling and
     # publishes the wrap-up turn, no auto-advance.
@@ -420,7 +548,7 @@ def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypa
         return iter([_result_event("done")])
 
     monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "s2")
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "s2")
 
     asyncio.run(session_runner.retry_session_job(row_id, cwd))
 
@@ -454,7 +582,7 @@ def test_retry_on_errored_implement_session_creates_a_new_row_and_completes(clie
         "stream_prompt",
         lambda prompt, **kw: iter([_result_event("Implemented PRD #12", session_id="impl-retry")]),
     )
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "pooled-retry")
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "pooled-retry")
 
     response = client.post(f"/api/sessions/{row_id}/retry")
     assert response.status_code == 200
@@ -545,7 +673,7 @@ def test_retry_on_creating_prd_phase_is_unaffected_by_implement_branch(client, t
         return iter([_result_event("done")])
 
     monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "s2")
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "s2")
 
     asyncio.run(session_runner.retry_session_job(row_id, cwd))
 
@@ -567,7 +695,7 @@ def test_start_implement_job_reaches_implemented_and_pools_falling_back_to_seede
         "stream_prompt",
         lambda prompt, **kw: iter([_result_event("Implemented PRD #5", session_id="impl1")]),
     )
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "pooled-1")
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "pooled-1")
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -609,7 +737,7 @@ def test_start_implement_job_populates_details_from_tracker_file_when_present(cl
     monkeypatch.setattr(
         session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("done", session_id="impl2")])
     )
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "pooled-2")
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "pooled-2")
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -730,7 +858,7 @@ def test_serial_mode_queues_second_prd_and_drains_it_when_first_finishes(client,
     monkeypatch.setattr(
         session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("Implemented PRD #5", session_id="impl-a")])
     )
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "pooled-a")
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "pooled-a")
 
     started = asyncio.run(session_runner.start_or_queue_implement(project_id, 5, "PRD Five", cwd))
     row_a = started["card_id"]
@@ -756,7 +884,7 @@ def test_serial_mode_queues_second_prd_and_drains_it_when_first_finishes(client,
         return iter([_result_event("Implemented PRD #5", session_id="impl-a")])
 
     monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: f"pooled-{session_id}")
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: f"pooled-{session_id}")
 
     async def run_a_and_drain():
         await session_runner.start_implement_job(row_a, 5, cwd=cwd)
@@ -798,7 +926,7 @@ def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch)
         return iter([_result_event("done")])
 
     monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None: "pooled-session")
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None: "pooled-session")
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd_a, confirm_advance=True))
 
     row = db.get_session(conn, row_id)

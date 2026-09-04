@@ -105,6 +105,7 @@ def app_state():
     root_dir = db.get_root_dir(conn)
     afk_hours = db.get_afk_hours(conn)
     parallel_implementation = db.get_parallel_implementation(conn)
+    model = db.get_model(conn)
 
     active_project = None
     if _active_project_id is not None:
@@ -121,6 +122,7 @@ def app_state():
         "root_dir": root_dir,
         "afk_hours": afk_hours,
         "parallel_implementation": parallel_implementation,
+        "model": model,
         "active_project": active_project,
         "projects": projects,
     }
@@ -167,6 +169,14 @@ def set_parallel_implementation(body: dict):
     parallel_implementation = bool(body["parallel_implementation"])
     db.set_parallel_implementation(conn, parallel_implementation)
     return {"parallel_implementation": parallel_implementation}
+
+
+@app.post("/api/settings/model")
+def set_model(body: dict):
+    conn = db.get_connection()
+    model = body["model"]
+    db.set_model(conn, model)
+    return {"model": model}
 
 
 @app.post("/api/projects/{project_id}/open")

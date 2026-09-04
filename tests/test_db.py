@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 from baton import db
 
@@ -39,6 +40,46 @@ def test_parallel_implementation_round_trip(tmp_path):
 
     db.set_parallel_implementation(reopened, True)
     assert db.get_parallel_implementation(reopened) is True
+
+
+def test_model_round_trip(tmp_path):
+    db_path = tmp_path / "baton.db"
+    conn = db.get_connection(db_path)
+    assert db.get_model(conn) == "claude-sonnet-4-6"
+
+    db.set_model(conn, "claude-opus-4-8")
+    assert db.get_model(conn) == "claude-opus-4-8"
+
+    reopened = db.get_connection(db_path)
+    assert db.get_model(reopened) == "claude-opus-4-8"
+
+
+def test_model_column_migrates_existing_db_without_data_loss(tmp_path):
+    """A DB created before `settings.model` existed (simulated here by
+    building the pre-migration schema by hand) must gain the column,
+    default to claude-sonnet-4-6, and keep its other settings intact when
+    `get_connection` runs its guarded ALTER TABLE."""
+    db_path = tmp_path / "baton.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            root_dir TEXT,
+            afk_hours INTEGER NOT NULL DEFAULT 6,
+            parallel_implementation INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    conn.execute("INSERT INTO settings (id, root_dir, afk_hours) VALUES (1, '/some/root', 9)")
+    conn.commit()
+    conn.close()
+
+    migrated = db.get_connection(db_path)
+    assert db.get_model(migrated) == "claude-sonnet-4-6"
+    # Pre-existing data survived the migration untouched.
+    assert db.get_root_dir(migrated) == "/some/root"
+    assert db.get_afk_hours(migrated) == 9
 
 
 def test_project_open_close_reopen_preserves_state(tmp_path):
@@ -114,6 +155,22 @@ def test_create_session_seeds_session_type_phase_and_details(tmp_path):
     assert row["session_type"] == "implement"
     assert row["phase"] == "implementing"
     assert json.loads(row["details_json"]) == {"prd": {"number": 3, "title": "T"}}
+
+
+def test_create_session_defaults_model_to_claude_sonnet(tmp_path):
+    conn = db.get_connection(tmp_path / "baton.db")
+    row_id = db.create_session(conn, project_id=1)
+
+    row = db.get_session(conn, row_id)
+    assert row["model"] == "claude-sonnet-4-6"
+
+
+def test_create_session_accepts_explicit_model(tmp_path):
+    conn = db.get_connection(tmp_path / "baton.db")
+    row_id = db.create_session(conn, project_id=1, model="claude-opus-4-8")
+
+    row = db.get_session(conn, row_id)
+    assert row["model"] == "claude-opus-4-8"
 
 
 def test_create_session_defaults_session_type_to_do(tmp_path):

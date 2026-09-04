@@ -168,9 +168,9 @@ def stream_prompt(
             raise ClaudeCLIError(f"claude exited with {returncode}: {stderr.strip()}")
 
 
-def clear_session(session_id: str, *, cwd: str | None = None) -> str:
+def clear_session(session_id: str, *, cwd: str | None = None, model: str | None = None) -> str:
     """Clear a session's context and return the new session_id it continues as."""
-    response = run_prompt("/clear", session_id=session_id, cwd=cwd)
+    response = run_prompt("/clear", session_id=session_id, cwd=cwd, model=model)
     return response["session_id"]
 
 

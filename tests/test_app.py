@@ -41,6 +41,19 @@ def test_set_parallel_implementation_persists_and_reflects_in_app_state(client):
     assert client.get("/api/app-state").json()["parallel_implementation"] is True
 
 
+def test_app_state_defaults_model_to_claude_sonnet(client):
+    state = client.get("/api/app-state").json()
+    assert state["model"] == "claude-sonnet-4-6"
+
+
+def test_set_model_persists_and_reflects_in_app_state(client):
+    resp = client.post("/api/settings/model", json={"model": "claude-opus-4-8"})
+    assert resp.json() == {"model": "claude-opus-4-8"}
+
+    state = client.get("/api/app-state").json()
+    assert state["model"] == "claude-opus-4-8"
+
+
 def test_root_dir_change_without_confirmation_leaves_projects_untouched(client, tmp_path):
     root_a = tmp_path / "root_a"
     root_a.mkdir()

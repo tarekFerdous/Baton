@@ -23,7 +23,7 @@ def test_fires_after_threshold_with_an_unblocked_prd(client, tmp_path, monkeypat
 
     calls = []
 
-    async def fake_start_or_queue_implement(pid, number, title, job_cwd):
+    async def fake_start_or_queue_implement(pid, number, title, job_cwd, **kwargs):
         calls.append((pid, number, title, job_cwd))
         return {"card_id": 1}
 
@@ -46,7 +46,7 @@ def test_does_not_fire_with_zero_unblocked_prds(client, tmp_path, monkeypatch):
 
     calls = []
 
-    async def fake_start_or_queue_implement(pid, number, title, job_cwd):
+    async def fake_start_or_queue_implement(pid, number, title, job_cwd, **kwargs):
         calls.append((pid, number, title, job_cwd))
         return {"card_id": 1}
 
@@ -71,7 +71,7 @@ def test_manual_click_resets_the_clock(client, tmp_path, monkeypatch):
 
     calls = []
 
-    async def fake_start_or_queue_implement(pid, number, title, job_cwd):
+    async def fake_start_or_queue_implement(pid, number, title, job_cwd, **kwargs):
         calls.append((pid, number, title, job_cwd))
         return {"card_id": 1}
 
@@ -95,7 +95,7 @@ def test_self_implement_firing_resets_the_clock(client, tmp_path, monkeypatch):
 
     calls = []
 
-    async def fake_start_or_queue_implement(pid, number, title, job_cwd):
+    async def fake_start_or_queue_implement(pid, number, title, job_cwd, **kwargs):
         calls.append((pid, number, title, job_cwd))
         return {"card_id": 1}
 
@@ -122,7 +122,7 @@ def test_switching_projects_scopes_the_clock(client, tmp_path, monkeypatch):
 
     calls = []
 
-    async def fake_start_or_queue_implement(pid, number, title, job_cwd):
+    async def fake_start_or_queue_implement(pid, number, title, job_cwd, **kwargs):
         calls.append((pid, number, title, job_cwd))
         return {"card_id": 1}
 
@@ -154,7 +154,7 @@ def test_a_fire_adds_exactly_one_notification(client, tmp_path, monkeypatch):
     db.set_afk_hours(conn, 1)
     afk_loop._last_activity[project_id] = time.monotonic() - 3700
 
-    async def fake_start_or_queue_implement(pid, number, title, job_cwd):
+    async def fake_start_or_queue_implement(pid, number, title, job_cwd, **kwargs):
         return {"card_id": 1}
 
     monkeypatch.setattr(session_runner, "start_or_queue_implement", fake_start_or_queue_implement)
@@ -173,7 +173,7 @@ def test_a_second_fire_before_dismissal_appends_a_second_notification(client, tm
     conn = db.get_connection()
     db.set_afk_hours(conn, 1)
 
-    async def fake_start_or_queue_implement(pid, number, title, job_cwd):
+    async def fake_start_or_queue_implement(pid, number, title, job_cwd, **kwargs):
         return {"card_id": 1}
 
     monkeypatch.setattr(session_runner, "start_or_queue_implement", fake_start_or_queue_implement)
@@ -204,6 +204,69 @@ def test_dismiss_notifications_empties_the_queue(client, tmp_path):
     assert afk_loop.get_notifications(project_id) == []
 
 
+def test_busy_project_is_skipped_without_queueing_or_notifying(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    db.set_afk_hours(conn, 1)
+    db.set_parallel_implementation(conn, False)
+
+    # Simulate serial mode already having an active implement session for
+    # this project -- the real `start_or_queue_implement` (not stubbed) must
+    # hit its busy branch and, with `allow_queue=False`, skip rather than
+    # enqueue.
+    db.create_session(
+        conn,
+        project_id,
+        session_type="implement",
+        phase="implementing",
+        details={"prd": {"number": 99, "title": "Running PRD"}},
+    )
+
+    afk_loop._last_activity[project_id] = time.monotonic() - 3700  # past threshold
+
+    asyncio.run(
+        afk_loop.check_once(project_id, cwd, _stub_prds((5, "Top PRD", False), (6, "Other PRD", True)))
+    )
+
+    # No queue entry, no new implement session started -- only the
+    # already-running one exists.
+    assert session_runner._implement_queues.get(project_id, []) == []
+    sessions = db.list_sessions_for_project(conn, project_id)
+    implement_sessions = [s for s in sessions if s["session_type"] == "implement"]
+    assert len(implement_sessions) == 1
+
+    assert afk_loop.get_notifications(project_id) == []
+
+
+def test_busy_project_still_resets_the_activity_clock(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    db.set_afk_hours(conn, 1)
+    db.set_parallel_implementation(conn, False)
+
+    db.create_session(
+        conn,
+        project_id,
+        session_type="implement",
+        phase="implementing",
+        details={"prd": {"number": 99, "title": "Running PRD"}},
+    )
+
+    afk_loop._last_activity[project_id] = time.monotonic() - 3700  # past threshold
+
+    before = time.monotonic()
+    asyncio.run(afk_loop.check_once(project_id, cwd, _stub_prds((5, "Top PRD", False))))
+    after = time.monotonic()
+
+    # The countdown restarts even though the fire was skipped as busy, so a
+    # subsequent 60s tick doesn't immediately retry.
+    assert before <= afk_loop._last_activity[project_id] <= after
+
+
 def test_a_fire_after_dismissal_produces_a_fresh_single_entry_list(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
@@ -211,7 +274,7 @@ def test_a_fire_after_dismissal_produces_a_fresh_single_entry_list(client, tmp_p
     conn = db.get_connection()
     db.set_afk_hours(conn, 1)
 
-    async def fake_start_or_queue_implement(pid, number, title, job_cwd):
+    async def fake_start_or_queue_implement(pid, number, title, job_cwd, **kwargs):
         return {"card_id": 1}
 
     monkeypatch.setattr(session_runner, "start_or_queue_implement", fake_start_or_queue_implement)

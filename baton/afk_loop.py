@@ -61,6 +61,15 @@ async def check_once(
     project's `afk_hours` setting, or if there's no unblocked PRD. Otherwise
     fires `session_runner.start_or_queue_implement` for the top unblocked
     entry and resets this project's idle clock.
+
+    The fire uses `allow_queue=False`: in serial mode, if the project
+    already has an active implement session, this AFK opportunity is
+    skipped outright (no queue entry, no notification) rather than being
+    queued to chain the instant that session finishes -- chaining through a
+    backlog that fast would have no relationship to the configured
+    `afk_hours` interval. The idle clock still resets on this tick either
+    way, so a skipped-due-to-busy tick starts a fresh `afk_hours` countdown
+    instead of retrying on every subsequent poll.
     """
     if project_id is None or cwd is None:
         return
@@ -81,8 +90,12 @@ async def check_once(
     # Reset before firing so a slow implement job can't cause a second fire
     # mid-flight on the next tick.
     record_activity(project_id)
+    result = await session_runner.start_or_queue_implement(
+        project_id, top["number"], top["title"], cwd, allow_queue=False
+    )
+    if result.get("skipped"):
+        return
     add_notification(project_id, top["number"], top["title"])
-    await session_runner.start_or_queue_implement(project_id, top["number"], top["title"], cwd)
 
 
 async def run_forever(

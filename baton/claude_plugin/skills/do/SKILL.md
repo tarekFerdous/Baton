@@ -26,7 +26,7 @@ Run the full grilling session until you have a clear, stable picture of what is 
 
 Invoke `/baton:to-prd`.
 
-**Override the default `/baton:to-prd` behaviour**: do NOT pause to ask the user whether the seams look correct. Proceed directly through all steps and publish the PRD as a GitHub issue using `gh issue create`. Apply the `ready-for-agent` triage label.
+**Override the default `/baton:to-prd` behaviour**: do NOT pause to ask the user whether the seams look correct. Proceed directly through all steps and publish the PRD as a GitHub issue using `gh issue create`. Apply both the `ready-for-agent` and `prd` triage labels.
 
 ---
 

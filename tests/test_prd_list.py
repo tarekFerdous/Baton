@@ -44,16 +44,6 @@ def test_prd_with_zero_children_counts_as_unblocked():
     assert result == [{"number": 34, "title": "Feature", "blocked": False}]
 
 
-def test_child_issue_mislabeled_ready_for_agent_is_excluded_from_prd_list():
-    # #31 carries the same `ready-for-agent` label as its parent PRD #30
-    # (as /to-issues does today) but has a `## Parent` section -- it's a
-    # nested slice, not a standalone PRD, and must not get its own card.
-    prds = [_prd(30, "Parent feature"), _child(31, 30)]
-    all_open = [_child(31, 30)]
-    result = compute_prd_list(prds, all_open)
-    assert result == [{"number": 30, "title": "Parent feature", "blocked": False}]
-
-
 def test_unblocked_prds_sort_before_blocked_ties_broken_by_ascending_number():
     prds = [_prd(50, "E"), _prd(20, "B"), _prd(30, "C"), _prd(10, "A")]
     all_open = [

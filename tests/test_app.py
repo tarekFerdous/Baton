@@ -217,6 +217,27 @@ def test_prds_endpoint_returns_empty_for_non_active_project(client):
     assert resp.json() == {"prds": []}
 
 
+def test_fetch_ready_prds_filters_by_prd_label_not_ready_for_agent(monkeypatch):
+    captured = {}
+
+    class _FakeResult:
+        returncode = 0
+        stdout = "[]"
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        return _FakeResult()
+
+    monkeypatch.setattr(app_module.subprocess, "run", fake_run)
+
+    app_module._fetch_ready_prds("/some/cwd")
+
+    assert "--label" in captured["cmd"]
+    label_index = captured["cmd"].index("--label")
+    assert captured["cmd"][label_index + 1] == "prd"
+    assert "ready-for-agent" not in captured["cmd"]
+
+
 def test_start_implement_endpoint_rejects_duplicate_session_for_same_prd(client, tmp_path, monkeypatch):
     root = tmp_path / "root"
     root.mkdir()

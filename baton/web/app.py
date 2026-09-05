@@ -227,8 +227,10 @@ def _active_project_cwd() -> str | None:
 
 
 def _fetch_ready_prds(cwd: str) -> list[dict]:
+    # Filters by the `prd` label (not `ready-for-agent`) so child issues from
+    # /to-issues -- which carry `ready-for-agent` only -- never show up here.
     result = subprocess.run(
-        ["gh", "issue", "list", "--state", "open", "--label", "ready-for-agent", "--json", "number,title,body,labels"],
+        ["gh", "issue", "list", "--state", "open", "--label", "prd", "--json", "number,title,body,labels"],
         cwd=cwd,
         capture_output=True,
         text=True,

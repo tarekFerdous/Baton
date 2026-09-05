@@ -1165,6 +1165,18 @@ _QA_BLOCK = """\
 }
 ```"""
 
+_IMPLEMENT_BLOCKED_BLOCK = """\
+Some preamble text.
+
+```json
+{
+  "phase": "implement_blocked",
+  "issue": 8,
+  "question": "Which auth provider should the login button use?",
+  "context": "The issue body doesn't specify Google vs GitHub OAuth."
+}
+```"""
+
 
 def test_start_implement_job_triggers_qa_session_when_result_contains_qa_block(client, tmp_path, monkeypatch):
     """When /implement Phase 5 runs /qa and the result includes the qa_grilling
@@ -1393,6 +1405,126 @@ def test_parse_qa_grilling_block_returns_none_for_plain_text(client, tmp_path):
     assert _parse_qa_grilling_block("Implemented PRD #5") is None
     assert _parse_qa_grilling_block("") is None
     assert _parse_qa_grilling_block('```json\n{"phase": "other"}\n```') is None
+
+
+def test_parse_implement_blocked_block_extracts_json_from_code_fence():
+    """_parse_implement_blocked_block must find and return the implement_blocked JSON block."""
+    from baton.session_runner import _parse_implement_blocked_block
+
+    result = _parse_implement_blocked_block(_IMPLEMENT_BLOCKED_BLOCK)
+    assert result is not None
+    assert result["phase"] == "implement_blocked"
+    assert result["issue"] == 8
+    assert "auth provider" in result["question"]
+
+
+def test_parse_implement_blocked_block_extracts_bare_json():
+    from baton.session_runner import _parse_implement_blocked_block
+
+    bare = json.dumps({"phase": "implement_blocked", "issue": None, "question": "Which one?", "context": "ambiguous"})
+    result = _parse_implement_blocked_block(bare)
+    assert result is not None
+    assert result["question"] == "Which one?"
+
+
+def test_parse_implement_blocked_block_returns_none_for_plain_text():
+    from baton.session_runner import _parse_implement_blocked_block
+
+    assert _parse_implement_blocked_block("Implemented PRD #5") is None
+    assert _parse_implement_blocked_block("") is None
+    assert _parse_implement_blocked_block(_QA_BLOCK) is None
+
+
+def test_start_implement_job_suspends_as_blocked_when_result_contains_blocked_marker(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    monkeypatch.setattr(
+        session_runner,
+        "stream_prompt",
+        lambda prompt, **kw: iter([_result_event(_IMPLEMENT_BLOCKED_BLOCK, session_id="impl-blocked")]),
+    )
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "blocked"
+    assert row["claude_session_id"] == "impl-blocked"
+    blocked = json.loads(row["blocked_json"])
+    assert blocked["question"] == "Which auth provider should the login button use?"
+    assert row["available_for_reuse"] == 0
+
+    events = live_stream._buffers.get(row_id, [])
+    assert any(e.get("type") == "turn" and e.get("phase") == "blocked" for e in events)
+    # Suspended, not finished -- no `done` yet, same shape as qa_grilling awaiting Perfect.
+    assert {"type": "done"} not in events
+
+
+def test_continue_implement_job_resolves_a_blocked_session(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="blocked",
+        claude_session_id="impl-blocked",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    db.update_session(conn, row_id, blocked_json=json.dumps({"phase": "implement_blocked", "question": "Which?"}))
+
+    seen_prompts = []
+
+    def fake_stream_prompt(prompt, **kw):
+        seen_prompts.append(prompt)
+        return iter([_result_event("Implemented, using GitHub OAuth as you said.", session_id="impl-done")])
+
+    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
+    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None, card_id=None: "pooled-1")
+
+    asyncio.run(session_runner.continue_implement_job(row_id, "Use GitHub OAuth", cwd=cwd))
+
+    assert seen_prompts == ["Use GitHub OAuth"]
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "implemented"
+    assert row["blocked_json"] is None
+    assert row["available_for_reuse"] == 1
+
+    events = live_stream._buffers.get(row_id, [])
+    assert events[-1] == {"type": "done"}
+
+
+def test_continue_implement_job_can_re_block_on_a_second_question(client, tmp_path, monkeypatch):
+    """A reply that doesn't fully unblock it must re-suspend as blocked
+    again, not error or silently complete."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="blocked",
+        claude_session_id="impl-blocked",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+
+    second_block = _IMPLEMENT_BLOCKED_BLOCK.replace("auth provider", "callback URL")
+    monkeypatch.setattr(
+        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event(second_block, session_id="impl-blocked-2")])
+    )
+
+    asyncio.run(session_runner.continue_implement_job(row_id, "GitHub OAuth", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "blocked"
+    blocked = json.loads(row["blocked_json"])
+    assert "callback URL" in blocked["question"]
+
+    events = live_stream._buffers.get(row_id, [])
+    assert {"type": "done"} not in events
 
 
 # ---------------------------------------------------------------------------

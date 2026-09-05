@@ -7,11 +7,25 @@ description: Pick a PRD from open GitHub issues, implement its child issues one 
 
 Execute implementation and testing for a chosen PRD. Follow each phase in order without skipping.
 
+**Never pause to ask the user a question during this skill.** Make the best autonomous call and proceed — do not seek confirmation ("are we ready?", "should I proceed?"), and do not ask which of several reasonable options to pick when a reasonable default exists. This applies everywhere in this skill except Phase 1's fallback PRD-selection prompt below, which only fires for a fresh, argument-less invocation with no PRD in context — a different kind of question (which PRD to work on at all, before any work has started) than the "can't proceed" case this directive is about.
+
+If you genuinely cannot proceed without information only the user has — not "which of two reasonable choices," but a real blocker — stop and emit this marker instead of asking inline:
+
+```json
+{"phase": "implement_blocked", "issue": <number-or-null>, "question": "<the question>", "context": "<why it's blocked>"}
+```
+
+Baton detects this marker and hands your question to the user through the app UI; your next turn will carry their reply as a normal message, resuming from here. Do not use this for anything a reasonable default would resolve — it exists for the rare case, not as a routine checkpoint.
+
 ---
 
 ## Phase 1 — PRD Selection
 
-If the invocation already specifies `prd: <N>` (e.g. `/baton:implement prd: 34`), skip this entire phase — no `gh issue list` fetch, no table, no pause — and go straight to Phase 2 using PRD issue N as the selected PRD. Otherwise, continue with steps 1-6 below.
+If the invocation already specifies `prd: <N>` (e.g. `/baton:implement prd: 34`), skip this entire phase — no `gh issue list` fetch, no table, no pause — and go straight to Phase 2 using PRD issue N as the selected PRD.
+
+Otherwise: if a PRD was already created earlier in this same conversation (e.g. via `/baton:do`), use that PRD's issue number directly and go straight to Phase 2 — it's already in your context, no need to ask or re-fetch anything.
+
+Otherwise (a genuinely fresh invocation, nothing in context, no `prd:` argument), continue with steps 1-6 below:
 
 1. Fetch all open issues:
    ```
@@ -39,13 +53,13 @@ Using only the child issues that belong to the selected PRD:
 2. Identify **unblocked** issues (those whose body says "None - can start immediately" or whose blockers are already closed).
 3. Implement all unblocked issues **one at a time, in this same continuous session** — do not dispatch sub-agents and do not implement issues in parallel, regardless of how many are unblocked at once. Baton-sized PRDs are small enough that sequential is cheap; parallel sub-agent fan-out is what was burning the account's rate-limit budget.
 4. Once unblocked issues are complete, resolve the next wave of now-unblocked issues — also one at a time.
-5. **Triage is human-only.** If any issue requires a triage decision, pause and ask the user before continuing.
+5. **Triage decisions are made autonomously by default.** Pick the most reasonable interpretation and proceed; note the call you made in that issue's tracker summary (Phase 4) rather than pausing over it. Only emit the blocked marker (above) if the issue is genuinely ambiguous in a way no reasonable default resolves.
 
 ---
 
 ## Phase 3 — Testing
 
-Run the project's full test suite. All tests must pass before continuing. Fix any failures.
+Run the project's full test suite. All tests must pass before continuing. Fix any failures autonomously; if a failure genuinely cannot be diagnosed or fixed without user-only information, emit the blocked marker (above) rather than leaving it broken or guessing destructively.
 
 ---
 

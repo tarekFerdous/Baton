@@ -181,6 +181,14 @@
     let leftCardId = null;
     let currentLeftSession = null;
     let preQaLeftSession = null;
+    // Same displacement/restore shape as preQaLeftSession, but tracked
+    // separately (a blocked implement session is a different case, not
+    // sharing state with a QA takeover) and keyed to the specific card_id
+    // that caused the takeover -- unlike the QA restore check (which only
+    // checks session_type), so a different, unrelated implement session
+    // finishing can't accidentally trigger a stale restore.
+    let preBlockedLeftSession = null;
+    let blockedTakeoverCardId = null;
     const rightCards = new Map();
     const backgroundSources = new Map();
 
@@ -352,6 +360,7 @@
           implemented: "Implemented",
           qa_grilling: "Verifying implementation...",
           qa_closing: "Closing issues...",
+          blocked: "Blocked — needs your input",
         }[phase] || "What are we doing?"
       );
     }
@@ -367,6 +376,7 @@
           implemented: "Implemented",
           qa_grilling: "Verifying implementation...",
           qa_closing: "Closing issues...",
+          blocked: "Blocked — needs input",
         }[phase] || phase
       );
     }
@@ -1090,6 +1100,36 @@
         return;
       }
 
+      if (event.phase === "blocked") {
+        if (leftCardId === cardId) {
+          // Already focused -- e.g. re-blocked on a follow-up question after a reply.
+          setHeading("Blocked — needs your input");
+          renderBlockedSession(snapshot);
+          return;
+        }
+
+        // Blocked session arriving as a background card -- always takes over
+        // the left card (unlike QA, no same-PRD exception: a stuck
+        // implementation blocks the whole PRD, so it always gets priority).
+        if (leftCardId !== null && currentLeftSession) {
+          preBlockedLeftSession = currentLeftSession;
+          rightCards.set(leftCardId, currentLeftSession);
+        }
+        if (eventSource) { eventSource.close(); eventSource = null; }
+        const bgEs = backgroundSources.get(cardId);
+        if (bgEs) { backgroundSources.delete(cardId); eventSource = bgEs; }
+
+        blockedTakeoverCardId = cardId;
+        leftCardId = cardId;
+        currentLeftSession = snapshot;
+        startForm.style.display = "none";
+        setHeading("Blocked — needs your input");
+        showOnly(mainFlowEl);
+        renderBlockedSession(snapshot);
+        renderQueue();
+        return;
+      }
+
       if (leftCardId !== cardId) return;
 
       if (event.phase === "grilling") {
@@ -1175,6 +1215,19 @@
         connectStream(restored.card_id);
       }
 
+      // Same restoration for a session that had taken over the left card via
+      // a blocker and has now finished -- keyed to the specific card_id that
+      // caused the takeover, not just session_type, so an unrelated
+      // implement session finishing elsewhere can't trigger a stale restore.
+      if (cardId === blockedTakeoverCardId && preBlockedLeftSession) {
+        const restored = preBlockedLeftSession;
+        preBlockedLeftSession = null;
+        blockedTakeoverCardId = null;
+        rightCards.delete(restored.card_id);
+        renderLeftSession(restored);
+        connectStream(restored.card_id);
+      }
+
       renderQueue();
 
       // A finishing `do` session means the grilling -> PRD -> issues chain
@@ -1238,6 +1291,46 @@
       }
       // Otherwise, the reply's effect (next questions, or hand-off to the next
       // phase) arrives asynchronously over the already-open event stream.
+    }
+
+    function renderBlockedSession(snapshot) {
+      interviewEl.innerHTML = "";
+      startForm.style.display = "none";
+
+      const blocked = snapshot.blocked || {};
+
+      const q = document.createElement("p");
+      q.className = "question-text";
+      q.textContent = blocked.question || "Implementation is blocked and needs your input.";
+      interviewEl.appendChild(q);
+
+      if (blocked.context) {
+        const ctx = document.createElement("p");
+        ctx.className = "preamble";
+        ctx.textContent = blocked.context;
+        interviewEl.appendChild(ctx);
+      }
+
+      interviewEl.appendChild(renderManualReply(sendImplementReply));
+    }
+
+    async function sendImplementReply(replyText, triggerBtn) {
+      if (!replyText.trim() || leftCardId === null) return;
+      triggerBtn.disabled = true;
+      const res = await fetch(`/api/sessions/${leftCardId}/implement-reply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reply: replyText }),
+      });
+      const data = await res.json();
+      triggerBtn.disabled = false;
+
+      if (data.error) {
+        showGrillingError(data.error);
+      }
+      // Otherwise, the reply's effect (re-blocked with a new question, or a
+      // normal completion) arrives asynchronously over the already-open
+      // event stream, same as sendReply/sendConfirmAdvance.
     }
 
     async function sendConfirmAdvance(triggerBtn) {
@@ -1450,6 +1543,14 @@
         setHeading(`QA — PRD #${prdNum}`);
         showOnly(mainFlowEl);
         renderQaGrilling(snap);
+        return;
+      }
+
+      if (session.phase === "blocked") {
+        const snap = cardSnapshots.get(session.card_id) || session;
+        setHeading("Blocked — needs your input");
+        showOnly(mainFlowEl);
+        renderBlockedSession(snap);
         return;
       }
 

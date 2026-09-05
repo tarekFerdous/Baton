@@ -277,6 +277,7 @@ def _session_to_dict(row) -> dict:
         "details": json.loads(row["details_json"]) if row["details_json"] else None,
         "error": row["error_text"],
         "needs_github_login": bool(row["needs_github_login"]),
+        "blocked": json.loads(row["blocked_json"]) if row["blocked_json"] else None,
     }
 
 
@@ -431,6 +432,18 @@ async def qa_complete(body: dict):
     cwd = _active_project_cwd()
     notes = body.get("notes", "")
     asyncio.create_task(session_runner.continue_qa_job(row["id"], notes, cwd=cwd))
+    return {"ok": True}
+
+
+@app.post("/api/sessions/{card_id}/implement-reply")
+async def implement_reply(card_id: int, body: dict):
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    if row is None:
+        return {"error": "Session not found"}
+    cwd = _active_project_cwd()
+    reply = body["reply"]
+    asyncio.create_task(session_runner.continue_implement_job(card_id, reply, cwd=cwd))
     return {"ok": True}
 
 

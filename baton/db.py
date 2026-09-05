@@ -110,6 +110,8 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
         )
     if "context_pct" not in session_columns:
         conn.execute("ALTER TABLE sessions ADD COLUMN context_pct REAL")
+    if "blocked_json" not in session_columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN blocked_json TEXT")
     conn.commit()
     return conn
 

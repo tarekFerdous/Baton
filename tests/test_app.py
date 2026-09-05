@@ -1,3 +1,4 @@
+import json
 import subprocess
 
 from baton import afk_loop, db, session_runner
@@ -397,3 +398,59 @@ def test_session_error_notifications_endpoint_round_trip(client, tmp_path):
     dismiss_resp = client.post(f"/api/projects/{project_id}/session-error-notifications/dismiss")
     assert dismiss_resp.json() == {"dismissed": True}
     assert client.get(f"/api/projects/{project_id}/session-error-notifications").json() == {"notifications": []}
+
+
+def test_implement_reply_endpoint_reaches_continue_implement_job(client, tmp_path, monkeypatch):
+    _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    card_id = db.create_session(
+        conn, 1, session_type="implement", phase="blocked",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+
+    received = {}
+
+    async def _fake_continue(card_id_arg, reply, *, cwd):
+        received["card_id"] = card_id_arg
+        received["reply"] = reply
+
+    monkeypatch.setattr(session_runner, "continue_implement_job", _fake_continue)
+
+    resp = client.post(f"/api/sessions/{card_id}/implement-reply", json={"reply": "Use GitHub OAuth"})
+    assert resp.json() == {"ok": True}
+    assert received["card_id"] == card_id
+    assert received["reply"] == "Use GitHub OAuth"
+
+
+def test_implement_reply_endpoint_returns_error_for_unknown_session(client):
+    resp = client.post("/api/sessions/9999/implement-reply", json={"reply": "anything"})
+    assert resp.json() == {"error": "Session not found"}
+
+
+def test_sessions_list_exposes_blocked_field(client, tmp_path):
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    card_id = db.create_session(
+        conn, project_id, session_type="implement", phase="blocked",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    db.update_session(
+        conn, card_id, blocked_json=json.dumps({"phase": "implement_blocked", "question": "Which one?"})
+    )
+
+    sessions = client.get(f"/api/projects/{project_id}/sessions").json()["sessions"]
+    [session] = [s for s in sessions if s["card_id"] == card_id]
+    assert session["blocked"] == {"phase": "implement_blocked", "question": "Which one?"}
+
+
+def test_sessions_list_blocked_is_none_when_not_blocked(client, tmp_path):
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id)
+
+    sessions = client.get(f"/api/projects/{project_id}/sessions").json()["sessions"]
+    [session] = [s for s in sessions if s["card_id"] == card_id]
+    assert session["blocked"] is None

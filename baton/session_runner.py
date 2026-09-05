@@ -13,7 +13,7 @@ import json
 import re
 from pathlib import Path
 
-_QA_GRILLING_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```")
+_FENCED_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```")
 
 from baton import db
 from baton.cli_client import ClaudeCLIError, clear_session, close_persistent_session, stream_prompt
@@ -215,7 +215,9 @@ async def _run_turn(
     return holder["turn"]
 
 
-def _turn_event(*, phase: str, interview=None, details=None, error=None, needs_github_login=False) -> dict:
+def _turn_event(
+    *, phase: str, interview=None, details=None, error=None, needs_github_login=False, blocked=None
+) -> dict:
     return {
         "type": "turn",
         "phase": phase,
@@ -223,6 +225,7 @@ def _turn_event(*, phase: str, interview=None, details=None, error=None, needs_g
         "details": details,
         "error": error,
         "needs_github_login": needs_github_login,
+        "blocked": blocked,
     }
 
 
@@ -514,7 +517,7 @@ def _parse_qa_grilling_block(text: str) -> dict | None:
     """Extract the first JSON code block with phase=='qa_grilling' from a
     CLI turn result, as emitted by the /qa skill Phase 2. Returns None when
     no such block is found (normal /implement run without the /qa auto-handoff)."""
-    for match in _QA_GRILLING_BLOCK_RE.finditer(text):
+    for match in _FENCED_JSON_BLOCK_RE.finditer(text):
         try:
             data = json.loads(match.group(1))
             if isinstance(data, dict) and data.get("phase") == "qa_grilling":
@@ -525,6 +528,28 @@ def _parse_qa_grilling_block(text: str) -> dict | None:
     try:
         data = json.loads(text.strip())
         if isinstance(data, dict) and data.get("phase") == "qa_grilling":
+            return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
+def _parse_implement_blocked_block(text: str) -> dict | None:
+    """Extract the first JSON code block with phase=='implement_blocked' from
+    a CLI turn result, as emitted by /baton:implement when it genuinely
+    cannot proceed without user-only information (see the skill's top-level
+    "never pause to ask" directive). Returns None for the normal,
+    not-blocked case -- structurally identical to `_parse_qa_grilling_block`."""
+    for match in _FENCED_JSON_BLOCK_RE.finditer(text):
+        try:
+            data = json.loads(match.group(1))
+            if isinstance(data, dict) and data.get("phase") == "implement_blocked":
+                return data
+        except (json.JSONDecodeError, ValueError):
+            continue
+    try:
+        data = json.loads(text.strip())
+        if isinstance(data, dict) and data.get("phase") == "implement_blocked":
             return data
     except (json.JSONDecodeError, ValueError):
         pass
@@ -619,7 +644,9 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
     it's in flight, then `implemented` on success with details replaced by
     the tracker file's contents (falling back to the seeded PRD stub if the
     tracker file is missing), then pool the session exactly like the /do
-    chain does."""
+    chain does. If the turn reports it's blocked instead (see
+    `_finish_implement_turn`), the session is left suspended in `phase:
+    blocked` for `continue_implement_job` to pick up."""
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
     model = row["model"]
@@ -645,8 +672,27 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
         await _drain_implement_queue(row["project_id"], cwd)
         return
 
+    await _finish_implement_turn(card_id, conn, row, turn, cwd=cwd, model=model, effort=effort)
+
+
+async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: str | None, model, effort) -> None:
+    """Shared tail for both `start_implement_job`'s first turn and
+    `continue_implement_job`'s resume turn: persist the turn's console
+    text/context usage, check for the `implement_blocked` marker (leaving
+    the session suspended in `phase: blocked` if found, with no `done` --
+    same "suspended, not finished" shape as a QA session awaiting Perfect),
+    and otherwise run the existing tracker-file/QA-handoff/pooling logic
+    exactly as before this function existed."""
     console_text = row["console_text"] + "\n\n" + turn["result"] if row["console_text"] else turn["result"]
     db.update_session(conn, card_id, console_text=console_text, context_pct=turn.get("context_pct"))
+
+    blocked = _parse_implement_blocked_block(turn["result"])
+    if blocked is not None:
+        db.update_session(
+            conn, card_id, claude_session_id=turn["session_id"], phase="blocked", blocked_json=json.dumps(blocked)
+        )
+        publish(card_id, _turn_event(phase="blocked", blocked=blocked))
+        return
 
     tracker = _read_tracker_file(cwd)
     if tracker is not None:
@@ -658,6 +704,7 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
         conn,
         card_id,
         phase="implemented",
+        blocked_json=None,
         details_json=json.dumps(details) if details is not None else None,
     )
 
@@ -690,6 +737,40 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
         await _drain_implement_queue(row["project_id"], cwd)
 
 
+async def continue_implement_job(card_id: int, reply: str, *, cwd: str | None) -> None:
+    """Called from POST /api/sessions/{card_id}/implement-reply. Resumes a
+    `phase: blocked` session with the user's reply as the next turn's
+    prompt, then runs it through the exact same `_finish_implement_turn`
+    tail as the original turn -- if the reply doesn't fully unblock it, the
+    result is another `implement_blocked` marker and the session stays
+    suspended for another reply (a natural loop: each reply is an
+    independent call, nothing here needs an explicit loop construct)."""
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    model = row["model"]
+    effort = row["effort"]
+
+    db.update_session(conn, card_id, phase="implementing", error_text=None)
+    publish(card_id, {"type": "phase", "phase": "implementing"})
+
+    try:
+        turn = await _run_turn(
+            card_id, reply, session_id=row["claude_session_id"], cwd=cwd, model=model, effort=effort
+        )
+    except ClaudeCLIError as e:
+        message = str(e)
+        needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
+        db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
+        publish(card_id, _turn_event(phase="implementing", error=message, needs_github_login=bool(needs_login)))
+        publish(card_id, {"type": "done"})
+        add_error_notification(row["project_id"], card_id, "implementing", message)
+        await _drain_implement_queue(row["project_id"], cwd)
+        return
+
+    row = db.get_session(conn, card_id)
+    await _finish_implement_turn(card_id, conn, row, turn, cwd=cwd, model=model, effort=effort)
+
+
 async def start_qa_job(card_id: int, qa_data: dict, *, cwd: str | None) -> None:
     """Publish the qa_grilling turn event for a QA session created by the
     /implement auto-handoff. The JSON block was already parsed from the
@@ -705,6 +786,7 @@ async def start_qa_job(card_id: int, qa_data: dict, *, cwd: str | None) -> None:
         "details": None,
         "error": None,
         "needs_github_login": False,
+        "blocked": None,
     })
 
 

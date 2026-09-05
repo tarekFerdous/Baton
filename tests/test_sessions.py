@@ -666,7 +666,51 @@ def test_retry_on_publishing_phase_reruns_publisher_and_completes(client, tmp_pa
     assert details["issues"] == [{"number": 10, "title": "Only child"}]
 
 
-def test_to_prd_auth_failure_sets_error_and_needs_github_login(client, tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        ("gh: not logged in, run `gh auth login`", True),
+        ("You are not logged into any GitHub hosts. To log in, run: gh auth login", True),
+        ("authentication failed: invalid token", False),
+        ("permission denied (401)", False),
+        ("not logged in", False),
+        ("Claude CLI exited with code 1: 403 Forbidden", False),
+        ("boom", False),
+    ],
+)
+def test_is_gh_auth_failure_classifier(message, expected):
+    assert session_runner._is_gh_auth_failure(message) is expected
+
+
+def test_grilling_claude_cli_error_never_sets_needs_github_login(client, tmp_path, monkeypatch):
+    """Grilling's Claude turn never calls `gh` (see its skill instructions),
+    so a ClaudeCLIError here -- even one containing gh-shaped auth text --
+    must never be misclassified as a GitHub login need."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def failing_stream_prompt(prompt, **kw):
+        raise ClaudeCLIError("gh: not logged in, run `gh auth login`")
+
+    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert bool(row["needs_github_login"]) is False
+    assert "not logged in" in row["error_text"]
+
+    events = live_stream._buffers.get(row_id, [])
+    error_turns = [e for e in events if e.get("type") == "turn" and e.get("phase") == "grilling"]
+    assert error_turns[0]["needs_github_login"] is False
+
+
+def test_to_prd_claude_cli_error_never_sets_needs_github_login(client, tmp_path, monkeypatch):
+    """/to-prd is forbidden from calling `gh` (see its skill instructions), so
+    a ClaudeCLIError here -- even one containing gh-shaped auth text -- must
+    never be misclassified as a GitHub login need."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -688,11 +732,13 @@ def test_to_prd_auth_failure_sets_error_and_needs_github_login(client, tmp_path,
 
     row = db.get_session(conn, row_id)
     assert row["phase"] == "creating_prd"
-    assert bool(row["needs_github_login"]) is True
+    assert bool(row["needs_github_login"]) is False
     assert "not logged in" in row["error_text"]
 
     events = live_stream._buffers.get(row_id, [])
     assert events[-1] == {"type": "done"}
+    error_turns = [e for e in events if e.get("type") == "turn" and e.get("phase") == "creating_prd"]
+    assert error_turns[0]["needs_github_login"] is False
 
 
 def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypatch):
@@ -962,6 +1008,38 @@ def test_start_implement_job_error_leaves_session_in_implementing_with_error_tex
     assert row["phase"] == "implementing"
     assert bool(row["needs_github_login"]) is True
     assert "not logged in" in row["error_text"]
+
+    events = live_stream._buffers.get(row_id, [])
+    assert events[-1] == {"type": "done"}
+
+
+def test_start_implement_job_non_gh_error_does_not_set_needs_github_login(client, tmp_path, monkeypatch):
+    """A ClaudeCLIError during implementing that isn't actually a `gh` auth
+    failure (no `gh auth login` remediation text) must not trigger the
+    GitHub login button, even though it mentions a generic auth-ish word."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def failing_stream_prompt(prompt, **kw):
+        raise ClaudeCLIError("Claude CLI exited with code 1: permission denied")
+
+    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn,
+        project_id,
+        session_type="implement",
+        phase="implementing",
+        details={"prd": {"number": 11, "title": "Errorable"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 11, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "implementing"
+    assert bool(row["needs_github_login"]) is False
+    assert "permission denied" in row["error_text"]
 
     events = live_stream._buffers.get(row_id, [])
     assert events[-1] == {"type": "done"}
@@ -1837,6 +1915,52 @@ def test_qa_closing_error_in_background_raises_a_notification(client, tmp_path, 
     assert notifications[0]["card_id"] == qa_row_id
     assert notifications[0]["phase"] == "qa_closing"
     assert "qa boom" in notifications[0]["message"]
+
+
+def test_qa_closing_gh_auth_error_sets_needs_github_login(client, tmp_path, monkeypatch):
+    """/qa's closing step calls `gh issue close`/`gh issue edit` directly, so
+    a genuine gh auth failure must still surface the GitHub login button."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def failing_stream_prompt(prompt, **kw):
+        raise ClaudeCLIError("gh: not logged in, run `gh auth login`")
+
+    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
+
+    conn = db.get_connection()
+    qa_row_id = db.create_session(
+        conn, project_id, session_type="qa", phase="qa_grilling",
+        claude_session_id="qa-session-1", details={"prd": {"number": 7, "title": "Test PRD"}},
+    )
+    asyncio.run(session_runner.continue_qa_job(qa_row_id, "notes", cwd=cwd))
+
+    row = db.get_session(conn, qa_row_id)
+    assert bool(row["needs_github_login"]) is True
+    assert "not logged in" in row["error_text"]
+
+
+def test_qa_closing_non_gh_error_does_not_set_needs_github_login(client, tmp_path, monkeypatch):
+    """A ClaudeCLIError during qa closing that isn't actually a `gh` auth
+    failure must not trigger the GitHub login button."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def failing_stream_prompt(prompt, **kw):
+        raise ClaudeCLIError("Claude CLI exited with code 1: authentication error")
+
+    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
+
+    conn = db.get_connection()
+    qa_row_id = db.create_session(
+        conn, project_id, session_type="qa", phase="qa_grilling",
+        claude_session_id="qa-session-1", details={"prd": {"number": 7, "title": "Test PRD"}},
+    )
+    asyncio.run(session_runner.continue_qa_job(qa_row_id, "notes", cwd=cwd))
+
+    row = db.get_session(conn, qa_row_id)
+    assert bool(row["needs_github_login"]) is False
+    assert "authentication error" in row["error_text"]
 
 
 def test_dismiss_error_notifications_clears_the_project_queue(client, tmp_path):

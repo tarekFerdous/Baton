@@ -22,7 +22,21 @@ from baton.live_stream import publish
 from baton.qa_parser import parse_grilling_response
 from baton.stream_translate import translate_event
 
-_AUTH_FAILURE_RE = re.compile(r"auth|login|not logged in|permission denied|401|403", re.IGNORECASE)
+# The old broad pattern (`auth|login|not logged in|permission denied|401|403`)
+# matched any Claude CLI failure that happened to contain one of those common
+# words, producing a false "Login with GitHub" prompt for errors that had
+# nothing to do with GitHub. This classifier instead looks for `gh`'s own
+# remediation text, which only appears in a genuine unauthenticated `gh` CLI
+# failure -- not a generic Claude CLI error.
+_GH_AUTH_FAILURE_RE = re.compile(r"gh auth login", re.IGNORECASE)
+
+
+def _is_gh_auth_failure(message: str) -> bool:
+    """True only when `message` is shaped like a real unauthenticated `gh`
+    CLI failure, grounded in `gh`'s own "gh auth login" remediation hint --
+    not any Claude CLI failure that merely contains a generic word like
+    "auth", "login", "permission denied", "401", or "403"."""
+    return bool(_GH_AUTH_FAILURE_RE.search(message))
 _DETAIL_RE = re.compile(r"\b(PRD|Issue)\s*#(\d+)\s*[:\-]\s*(.+)", re.IGNORECASE)
 
 # Context-window budget: before starting the next phase in a session chain,
@@ -271,12 +285,14 @@ async def _run_grilling_turn(
             persistent=True,
         )
     except ClaudeCLIError as e:
+        # Grilling's Claude turn never calls `gh` (see .claude/skills' own
+        # instructions), so any match here would be a false positive --
+        # always report no GitHub login is needed.
         message = str(e)
-        needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
         db.update_session(
-            conn, card_id, model=model, effort=effort, error_text=message, needs_github_login=needs_login
+            conn, card_id, model=model, effort=effort, error_text=message, needs_github_login=0
         )
-        publish(card_id, _turn_event(phase="grilling", error=message, needs_github_login=bool(needs_login)))
+        publish(card_id, _turn_event(phase="grilling", error=message, needs_github_login=False))
         return None
 
     parsed = parse_grilling_response(turn["result"])
@@ -320,10 +336,12 @@ async def _run_chain_step(
             persistent=True,
         )
     except ClaudeCLIError as e:
+        # /to-prd and /to-issues are explicitly forbidden from calling `gh`
+        # (see their skill instructions), so any match here would be a false
+        # positive -- always report no GitHub login is needed.
         message = str(e)
-        needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
-        db.update_session(conn, row["id"], error_text=message, needs_github_login=needs_login)
-        publish(card_id, _turn_event(phase=phase, error=message, needs_github_login=bool(needs_login)))
+        db.update_session(conn, row["id"], error_text=message, needs_github_login=0)
+        publish(card_id, _turn_event(phase=phase, error=message, needs_github_login=False))
         publish(card_id, {"type": "done"})
         return False, None
 
@@ -354,7 +372,7 @@ async def _run_publish_step(card_id: int, conn, row, *, cwd: str | None) -> bool
         result_text = await asyncio.to_thread(publish_draft, draft_path, cwd)
     except GithubPublishError as e:
         message = str(e)
-        needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
+        needs_login = 1 if _is_gh_auth_failure(message) else 0
         db.update_session(conn, row["id"], error_text=message, needs_github_login=needs_login)
         publish(card_id, _turn_event(phase="publishing", error=message, needs_github_login=bool(needs_login)))
         publish(card_id, {"type": "done"})
@@ -663,8 +681,10 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
             effort=effort,
         )
     except ClaudeCLIError as e:
+        # /implement's PRD-selection step calls `gh issue list` directly, so
+        # a genuine gh auth failure is possible here -- classify it.
         message = str(e)
-        needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
+        needs_login = 1 if _is_gh_auth_failure(message) else 0
         db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
         publish(card_id, _turn_event(phase="implementing", error=message, needs_github_login=bool(needs_login)))
         publish(card_id, {"type": "done"})
@@ -759,7 +779,7 @@ async def continue_implement_job(card_id: int, reply: str, *, cwd: str | None) -
         )
     except ClaudeCLIError as e:
         message = str(e)
-        needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
+        needs_login = 1 if _is_gh_auth_failure(message) else 0
         db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
         publish(card_id, _turn_event(phase="implementing", error=message, needs_github_login=bool(needs_login)))
         publish(card_id, {"type": "done"})
@@ -813,8 +833,10 @@ async def continue_qa_job(card_id: int, notes: str, *, cwd: str | None) -> None:
             card_id, prompt, session_id=row["claude_session_id"], cwd=cwd, model=model, effort=effort
         )
     except ClaudeCLIError as e:
+        # /qa's closing step calls `gh issue close`/`gh issue edit` directly,
+        # so a genuine gh auth failure is possible here -- classify it.
         message = str(e)
-        needs_login = 1 if _AUTH_FAILURE_RE.search(message) else 0
+        needs_login = 1 if _is_gh_auth_failure(message) else 0
         db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
         publish(card_id, _turn_event(phase="qa_closing", error=message, needs_github_login=bool(needs_login)))
         publish(card_id, {"type": "done"})
